@@ -14,7 +14,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(**name**)
 
-TOKEN = os.getenv(‘TELEGRAM_BOT_TOKEN’)
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN’)
 CHAT_ID = os.getenv(‘CHAT_ID’)
 
 DEX_PROFILES = ‘https://api.dexscreener.com/token-profiles/latest/v1’

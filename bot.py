@@ -377,5 +377,5 @@ jq.run_repeating(track_job, interval=120, first=60)
 logger.info(‘GemStalker running’)
 app.run_polling()
 
-if **name** == ‘**main**’:
+if __name__ == ‘__main__’:
 main()

@@ -24,8 +24,6 @@ logger = logging.getLogger(**name**)
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
 
-raise ValueError(“Missing TELEGRAM_BOT_TOKEN”)
-
 DEX_PROFILES = “https://api.dexscreener.com/token-profiles/latest/v1”
 DEX_BOOSTS = “https://api.dexscreener.com/token-boosts/latest/v1”
 DEX_TOKEN = “https://api.dexscreener.com/latest/dex/tokens/”

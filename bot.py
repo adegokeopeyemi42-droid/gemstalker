@@ -21,8 +21,8 @@ filters,
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(**name**)
 
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv(“CHAT_ID”)
+TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
+CHAT_ID = os.getenv('CHAT_ID')
 
 if not TOKEN:
 raise ValueError(“Missing TELEGRAM_BOT_TOKEN”)

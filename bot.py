@@ -25,7 +25,7 @@ DEXSCREENER_TOKENS_URL = “https://api.dexscreener.com/latest/dex/tokens/”
 PUMP_FUN_URL = “https://frontend-api.pump.fun/coins?limit=20&sort=created_timestamp&order=DESC”
 SOLANA_RPC_URL = “https://api.mainnet-beta.solana.com”
 
-# ── Filter thresholds ──────────────────────────────────────────────────────────
+# – Filter thresholds –––––––––––––––––––––––––––––
 
 MIN_MC = 25_000
 MAX_MC = 200_000
@@ -39,7 +39,7 @@ MAX_AGE_MIN = 30
 MAX_TOP10_PCT = 18.0
 MAX_DEV_PCT = 3.0
 
-# ── State ──────────────────────────────────────────────────────────────────────
+# – State –––––––––––––––––––––––––––––––––––
 
 cycle_count = 0
 start_time: float = 0.0
@@ -65,19 +65,19 @@ tracked_tokens: dict = {}
 daily_calls: list = []
 daily_reset_date: str = “”
 
-# ── Flask keep-alive server ────────────────────────────────────────────────────
+# – Flask keep-alive server ––––––––––––––––––––––––––
 
 flask_app = Flask(**name**)
 
 @flask_app.route(”/”)
 def health():
-return {“status”: “GemStalker is alive 💎”, “cycles”: stats[“cycles”], “alerts”: stats[“alerts_sent”]}
+return {“status”: “GemStalker is alive -”, “cycles”: stats[“cycles”], “alerts”: stats[“alerts_sent”]}
 
 def run_flask():
 port = int(os.environ.get(“PORT”, 8080))
 flask_app.run(host=“0.0.0.0”, port=port)
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# – Helpers ––––––––––––––––––––––––––––––––––
 
 def fmt_usd(val) -> str:
 if val in (None, “N/A”):
@@ -97,12 +97,12 @@ return bool(re.fullmatch(r”[1-9A-HJ-NP-Za-km-z]{32,44}”, text.strip()))
 
 def potential_label(score: int, mc: float) -> str:
 if mc < 40_000 and score >= 90:
-return “10x 🔥”
+return “10x -”
 if mc < 100_000 and score >= 85:
-return “5x 🚀”
+return “5x -”
 if score >= 70:
-return “2x ✅”
-return “Low ❌”
+return “2x -”
+return “Low -”
 
 def build_token_card(
 name, symbol, mc, liquidity, volume, age_min, buy_pct,
@@ -111,31 +111,31 @@ holder_count, whale_alert, txns_5m, score, address, chain, source=””
 ) -> str:
 potential = potential_label(score, mc)
 dex_link = f”https://dexscreener.com/{chain}/{address}”
-src_line = f”📡 {source}\n” if source else “”
+src_line = f”- {source}\n” if source else “”
 top10_str = f”{top10_pct:.1f}%” if top10_pct is not None else “N/A”
 dev_str = f”{dev_pct:.1f}%” if dev_pct is not None else “N/A”
 holders_str = str(holder_count) if holder_count is not None else “N/A”
 
 ```
 return (
-    f"🚨 *HIGH POTENTIAL GEM*\n"
-    f"💎 *{name}* (${symbol})\n"
+    f"- *HIGH POTENTIAL GEM*\n"
+    f"- *{name}* (${symbol})\n"
     f"{src_line}"
-    f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"📊 MC: {fmt_usd(mc)} | Liq: {fmt_usd(liquidity)}\n"
-    f"📈 Vol: {fmt_usd(volume)} | Age: {age_min:.0f}m\n"
-    f"🟢 Buys: {buy_pct:.0f}% | 5m txns: {txns_5m}\n"
-    f"🔒 Mint: {'✅' if mint_revoked else '❌'} | Freeze: {'✅' if freeze_revoked else '❌'}\n"
-    f"📊 Top10: {top10_str} | 👨‍💻 Dev: {dev_str}\n"
-    f"🐋 Whale: {'⚠️ YES' if whale_alert else '✅ No'} | 👥 Holders: {holders_str}\n"
-    f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"🎯 Score: {score}/100\n"
-    f"🚀 Potential: {potential}\n"
-    f"🔗 [Dexscreener]({dex_link})"
+    f"--------------------\n"
+    f"- MC: {fmt_usd(mc)} | Liq: {fmt_usd(liquidity)}\n"
+    f"- Vol: {fmt_usd(volume)} | Age: {age_min:.0f}m\n"
+    f"- Buys: {buy_pct:.0f}% | 5m txns: {txns_5m}\n"
+    f"- Mint: {'-' if mint_revoked else '-'} | Freeze: {'-' if freeze_revoked else '-'}\n"
+    f"- Top10: {top10_str} | --- Dev: {dev_str}\n"
+    f"- Whale: {'-- YES' if whale_alert else '- No'} | - Holders: {holders_str}\n"
+    f"--------------------\n"
+    f"- Score: {score}/100\n"
+    f"- Potential: {potential}\n"
+    f"- [Dexscreener]({dex_link})"
 )
 ```
 
-# ── API calls ──────────────────────────────────────────────────────────────────
+# – API calls ——————————————————————
 
 async def get_dexscreener_pair(address: str):
 try:
@@ -217,7 +217,7 @@ return None
 now_ms = time.time() * 1000
 return (now_ms - float(created_at)) / 60_000
 
-# ── Scoring ────────────────────────────────────────────────────────────────────
+# – Scoring ––––––––––––––––––––––––––––––––––
 
 def score_token(volume, liquidity, change_24h, buy_pct, mint_revoked,
 freeze_revoked, has_twitter, has_telegram, top10_pct,
@@ -267,7 +267,7 @@ if whale_alert: score -= 10
 return max(0, min(score, 100))
 ```
 
-# ── Token processing ───────────────────────────────────────────────────────────
+# – Token processing ———————————————————–
 
 async def process_token(address, source, name, symbol, twitter, telegram, bot) -> None:
 if address in seen_tokens:
@@ -505,14 +505,14 @@ elapsed_min = int((time.time() - entry[“alert_time”]) / 60)
             if multiple >= target and label not in entry["milestones_hit"]:
                 entry["milestones_hit"].add(label)
                 pnl_card = (
-                    f"🏆 *PnL Update — {label} Hit!*\n"
-                    f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"💎 {entry['name']} (${entry['symbol']})\n"
-                    f"📊 Entry MC: {fmt_usd(entry['entry_mc'])}\n"
-                    f"📈 Current MC: {fmt_usd(current_mc)}\n"
-                    f"🚀 Multiple: `{multiple:.2f}x`\n"
-                    f"⏱ Time to {label}: `{elapsed_min}m`\n"
-                    f"🔗 [Dexscreener](https://dexscreener.com/solana/{address})"
+                    f"- *PnL Update - {label} Hit!*\n"
+                    f"--------------------\n"
+                    f"- {entry['name']} (${entry['symbol']})\n"
+                    f"- Entry MC: {fmt_usd(entry['entry_mc'])}\n"
+                    f"- Current MC: {fmt_usd(current_mc)}\n"
+                    f"- Multiple: `{multiple:.2f}x`\n"
+                    f"- Time to {label}: `{elapsed_min}m`\n"
+                    f"- [Dexscreener](https://dexscreener.com/solana/{address})"
                 )
                 await bot.send_message(
                     chat_id=CHAT_ID, text=pnl_card,
@@ -535,16 +535,16 @@ daily_reset_date = today
 async def midnight_reset_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 _ensure_daily_reset()
 
-# ── Scan helper ────────────────────────────────────────────────────────────────
+# – Scan helper ––––––––––––––––––––––––––––––––
 
 async def do_scan(address: str, reply_fn) -> None:
-await reply_fn(f”🔍 Scanning `{address}`…”, parse_mode=“Markdown”)
+await reply_fn(f”- Scanning `{address}`…”, parse_mode=“Markdown”)
 pair, oc = await asyncio.gather(
 get_dexscreener_pair(address),
 check_solana_on_chain(address),
 )
 if not pair:
-await reply_fn(“❌ No Solana token data found for that address.”)
+await reply_fn(”- No Solana token data found for that address.”)
 return
 
 ```
@@ -596,43 +596,43 @@ card = build_token_card(
 )
 
 vol_liq = volume / liquidity if liquidity > 0 else 0
-chg_arrow = "🟢" if change_24h >= 0 else "🔴"
-dev_addr_str = f"`{dev_address[:12]}...`" if dev_address else "❌"
+chg_arrow = "-" if change_24h >= 0 else "-"
+dev_addr_str = f"`{dev_address[:12]}...`" if dev_address else "-"
 extra = (
-    f"\n━━━━━━━━━━━━━━━━━━━━\n"
+    f"\n--------------------\n"
     f"{chg_arrow} 24h: `{change_24h:+.1f}%` | Vol/Liq: `{vol_liq:.1f}x`\n"
-    f"🟢 Buys: `{buys:,}` | 🔴 Sells: `{sells:,}`\n"
-    f"👨‍💻 Dev addr: {dev_addr_str}"
+    f"- Buys: `{buys:,}` | - Sells: `{sells:,}`\n"
+    f"--- Dev addr: {dev_addr_str}"
 )
 
 await reply_fn(card + extra, parse_mode="Markdown", disable_web_page_preview=True)
 ```
 
-# ── Commands ───────────────────────────────────────────────────────────────────
+# – Commands —————————————————————––
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 await update.message.reply_text(
-“💎 *GemStalker is active*\n\n”
+“- *GemStalker is active*\n\n”
 “Just paste any Solana CA to scan it instantly.\n\n”
 “Commands:\n”
-“/scan <address> — scan a token\n”
-“/calls — today’s alert log\n”
-“/status — scanner stats\n”
-“/help — all commands”,
+“/scan <address> - scan a token\n”
+“/calls - today’s alert log\n”
+“/status - scanner stats\n”
+“/help - all commands”,
 parse_mode=“Markdown”
 )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 await update.message.reply_text(
-“💎 *GemStalker Commands*\n\n”
-“/scan <address> — scan any Solana token\n”
-“/calls — today’s alerted tokens with multiples\n”
-“/status — live scanner stats\n”
-“/start — show intro\n\n”
+“- *GemStalker Commands*\n\n”
+“/scan <address> - scan any Solana token\n”
+“/calls - today’s alerted tokens with multiples\n”
+“/status - live scanner stats\n”
+“/start - show intro\n\n”
 f”Auto-scanner runs every 20s from Pump.fun + DexScreener.\n”
-f”Filters: MC {fmt_usd(MIN_MC)}–{fmt_usd(MAX_MC)} | “
+f”Filters: MC {fmt_usd(MIN_MC)}-{fmt_usd(MAX_MC)} | “
 f”Liq {fmt_usd(MIN_LIQUIDITY)} | Vol {fmt_usd(MIN_VOLUME)} | “
-f”Buys {MIN_BUY_PRESSURE:.0f}–{MAX_BUY_PRESSURE:.0f}% | “
+f”Buys {MIN_BUY_PRESSURE:.0f}-{MAX_BUY_PRESSURE:.0f}% | “
 f”Score {MIN_SCORE}/100”,
 parse_mode=“Markdown”
 )
@@ -653,23 +653,23 @@ total_filtered = sum(stats[k] for k in stats if k.startswith(“filter_”))
 
 ```
 msg = (
-    f"📊 *GemStalker Status*\n"
-    f"━━━━━━━━━━━━━━━━━━━━\n"
-    f"⏱ Uptime: `{uptime_str}`\n"
-    f"🔄 Cycles: `{stats['cycles']}`\n"
-    f"🔍 Checked: `{stats['tokens_checked']}`\n"
-    f"🚨 Alerts: `{stats['alerts_sent']}`\n"
-    f"👀 Seen: `{len(seen_tokens)}`\n"
-    f"━━━━━━━━━━━━━━━━━━━━\n"
+    f"- *GemStalker Status*\n"
+    f"--------------------\n"
+    f"- Uptime: `{uptime_str}`\n"
+    f"- Cycles: `{stats['cycles']}`\n"
+    f"- Checked: `{stats['tokens_checked']}`\n"
+    f"- Alerts: `{stats['alerts_sent']}`\n"
+    f"- Seen: `{len(seen_tokens)}`\n"
+    f"--------------------\n"
     f"*Rejections* ({total_filtered} total)\n"
-    f"💰 MC: `{stats['filter_mc']}`\n"
-    f"💧 Liquidity: `{stats['filter_liquidity']}`\n"
-    f"📊 Volume: `{stats['filter_volume']}`\n"
-    f"🟢 Buy pressure: `{stats['filter_buy_pressure']}`\n"
-    f"🕐 Age: `{stats['filter_age']}`\n"
-    f"👥 Concentration: `{stats['filter_concentration']}`\n"
-    f"🔒 Mint: `{stats['filter_mint']}`\n"
-    f"🎯 Score: `{stats['filter_score']}`"
+    f"- MC: `{stats['filter_mc']}`\n"
+    f"- Liquidity: `{stats['filter_liquidity']}`\n"
+    f"- Volume: `{stats['filter_volume']}`\n"
+    f"- Buy pressure: `{stats['filter_buy_pressure']}`\n"
+    f"- Age: `{stats['filter_age']}`\n"
+    f"- Concentration: `{stats['filter_concentration']}`\n"
+    f"- Mint: `{stats['filter_mint']}`\n"
+    f"- Score: `{stats['filter_score']}`"
 )
 await update.message.reply_text(msg, parse_mode="Markdown")
 ```
@@ -677,7 +677,7 @@ await update.message.reply_text(msg, parse_mode="Markdown")
 async def calls_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 _ensure_daily_reset()
 if not daily_calls:
-await update.message.reply_text(“📭 No calls today yet.”)
+await update.message.reply_text(”- No calls today yet.”)
 return
 
 ```
@@ -704,15 +704,15 @@ for i, call in enumerate(daily_calls, 1):
         multiple_str = "`N/A`"
 
     lines.append(
-        f"{i}. *{call['name']}* (${call['symbol']}) — {alert_dt}\n"
-        f"   Entry: {fmt_usd(entry_mc)} → {multiple_str}"
+        f"{i}. *{call['name']}* (${call['symbol']}) - {alert_dt}\n"
+        f"   Entry: {fmt_usd(entry_mc)} - {multiple_str}"
     )
 
 today_str = datetime.date.today().strftime("%b %d")
 header = (
-    f"📋 *Calls — {today_str}*\n"
+    f"- *Calls - {today_str}*\n"
     f"Total: `{len(daily_calls)}` | 2x+: `{hit_2x}`\n"
-    f"━━━━━━━━━━━━━━━━━━━━\n"
+    f"--------------------\n"
 )
 await update.message.reply_text(
     header + "\n".join(lines),
@@ -726,9 +726,9 @@ text = (update.message.text or “”).strip()
 if is_solana_address(text):
 await do_scan(text, update.message.reply_text)
 else:
-await update.message.reply_text(“💎 Paste a Solana CA to scan it, or use /help”)
+await update.message.reply_text(”- Paste a Solana CA to scan it, or use /help”)
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# – Main ———————————————————————–
 
 def main() -> None:
 global start_time, daily_reset_date
@@ -754,7 +754,7 @@ jq.run_repeating(monitor_job, interval=20, first=10)
 jq.run_repeating(track_price_job, interval=120, first=60)
 jq.run_repeating(midnight_reset_job, interval=3600, first=60)
 
-logger.info("GemStalker running 💎")
+logger.info("GemStalker running -")
 app.run_polling(allowed_updates=Update.ALL_TYPES)
 ```
 

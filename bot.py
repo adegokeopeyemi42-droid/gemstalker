@@ -61,10 +61,10 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler('start', start_cmd))
-    app.add_handler(CommandHandler('scan', scan_cmd))
-    app.add_handler(CommandHandler('status', status_cmd))
-    app.add_handler(CommandHandler('calls', calls_cmd))
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('scan', scan))
+    app.add_handler(CommandHandler('status', status))
+    app.add_handler(CommandHandler('calls', calls))
 
     app.add_handler(
         MessageHandler(

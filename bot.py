@@ -1,4 +1,3 @@
-# main.py
 import os
 import time
 import json
@@ -7,498 +6,296 @@ import logging
 from dataclasses import dataclass, field
 from collections import deque
 
-import httpx
 import websockets
-
-from telegram import (
-InlineKeyboardMarkup,
-InlineKeyboardButton,
-)
-
-from telegram.ext import (
-Application,
-)
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application
 
 # =========================================================
-
 # CONFIG
-
 # =========================================================
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+CHAT_ID  = os.getenv("CHAT_ID")
 
-PUMP_WS = "wss://pumpportal.fun/api/data"
-
-SOL_PRICE = 150
+PUMP_WS   = "wss://pumpportal.fun/api/data"
+SOL_PRICE = 150  # USD per SOL (update as needed)
 
 # =========================================================
-
 # FILTERS
-
 # =========================================================
 
-MC_MIN = 5_000
-MC_MAX = 50_000
-
-MIN_SOL_IN = 6
-MIN_HOLDERS = 20
+MC_MIN           = 5_000
+MC_MAX           = 50_000
+MIN_SOL_IN       = 6
+MIN_HOLDERS      = 20
 MIN_BUYS_PER_MIN = 10
-
-MAX_TOP_HOLDER = 20
+MAX_TOP_HOLDER   = 20
 
 # =========================================================
-
 # LOGGING
-
 # =========================================================
 
 logging.basicConfig(
-level=logging.INFO,
-format="%(asctime)s | %(levelname)s | %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
 )
-
-log = logging.getLogger(**name**)
+log = logging.getLogger(__name__)  # FIX: was **name** (broken dunder)
 
 # =========================================================
-
 # DATA MODEL
-
 # =========================================================
 
 @dataclass
 class Token:
+    mint: str
 
-```
-mint: str
+    name:   str   = "Unknown"
+    symbol: str   = "?"
 
-name: str = "Unknown"
-symbol: str = "?"
+    market_cap:  float = 0.0
+    sol_in:      float = 0.0
 
-market_cap: float = 0
-sol_in: float = 0
+    holders:     int   = 0
+    top_holder:  float = 0.0
 
-holders: int = 0
-top_holder: float = 0
+    bonding_curve: float = 0.0
 
-bonding_curve: float = 0
+    buy_count:  int = 0
+    sell_count: int = 0
 
-buy_count: int = 0
-sell_count: int = 0
+    buy_volume:  float = 0.0
+    sell_volume: float = 0.0
 
-buy_volume: float = 0
-sell_volume: float = 0
+    migrated: bool = False
+    called:   bool = False
 
-migrated: bool = False
+    created_at: float = field(default_factory=time.time)
+    buys: deque = field(default_factory=lambda: deque(maxlen=300))
 
-called: bool = False
 
-created_at: float = field(default_factory=time.time)
-
-buys: deque = field(default_factory=lambda: deque(maxlen=300))
-```
-
-tokens = {}
+tokens: dict[str, Token] = {}
 
 # =========================================================
-
 # HELPERS
-
 # =========================================================
 
-def fmt(n):
+def fmt(n: float) -> str:
+    n = float(n)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.2f}K"
+    return f"{n:.2f}"
 
-```
-n = float(n)
 
-if n >= 1_000_000:
-    return f"{n/1_000_000:.2f}M"
+def buys_per_min(t: Token) -> float:
+    cutoff = time.time() - 120
+    return sum(1 for x in t.buys if x >= cutoff) / 2
 
-if n >= 1_000:
-    return f"{n/1_000:.2f}K"
 
-return f"{n:.2f}"
-```
+def buy_pressure(t: Token) -> int:
+    total = t.buy_count + t.sell_count
+    if total == 0:
+        return 0
+    return int((t.buy_count / total) * 100)
 
-def buys_per_min(t):
 
-```
-cutoff = time.time() - 120
+def alpha_score(t: Token) -> float:
+    score = 0.0
+    score += min(t.sol_in * 0.25, 3)
+    score += min(buys_per_min(t) * 0.15, 3)
+    score += min(t.holders / 50, 2)
+    if t.top_holder < 15:
+        score += 1
+    if buy_pressure(t) > 70:
+        score += 1
+    return round(min(score, 10), 1)
 
-return sum(1 for x in t.buys if x >= cutoff) / 2
-```
 
-def buy_pressure(t):
-
-```
-total = t.buy_count + t.sell_count
-
-if total == 0:
-    return 0
-
-return int((t.buy_count / total) * 100)
-```
-
-def alpha_score(t):
-
-```
-score = 0
-
-score += min(t.sol_in * 0.25, 3)
-
-score += min(buys_per_min(t) * 0.15, 3)
-
-score += min(t.holders / 50, 2)
-
-if t.top_holder < 15:
-    score += 1
-
-if buy_pressure(t) > 70:
-    score += 1
-
-return round(min(score, 10), 1)
-```
-
-def passes_filters(t):
-
-```
-if t.market_cap < MC_MIN:
-    return False
-
-if t.market_cap > MC_MAX:
-    return False
-
-if t.sol_in < MIN_SOL_IN:
-    return False
-
-if t.holders < MIN_HOLDERS:
-    return False
-
-if buys_per_min(t) < MIN_BUYS_PER_MIN:
-    return False
-
-if t.top_holder > MAX_TOP_HOLDER:
-    return False
-
-return True
-```
+def passes_filters(t: Token) -> bool:
+    if not (MC_MIN <= t.market_cap <= MC_MAX):
+        return False
+    if t.sol_in < MIN_SOL_IN:
+        return False
+    if t.holders < MIN_HOLDERS:
+        return False
+    if buys_per_min(t) < MIN_BUYS_PER_MIN:
+        return False
+    if t.top_holder > MAX_TOP_HOLDER:
+        return False
+    return True
 
 # =========================================================
-
-# ALERT UI
-
+# ALERT MESSAGE
 # =========================================================
 
-def build_alert(t):
-
-```
-pressure = buy_pressure(t)
-
-total_volume = t.buy_volume + t.sell_volume
-
-migration = (
-    "🚀 Raydium"
-    if t.migrated
-    else "⏳ Bonding Curve"
-)
-
-score = alpha_score(t)
-
-return f"""
-```
-
-🚨 EARLY GEM DETECTED 🚨
-
-🪙 Token:
-{t.name} ({t.symbol})
-
-💰 Market Cap:
-${fmt(t.market_cap)}
-
-💧 Liquidity:
-{t.sol_in:.2f} SOL
-
-📊 Volume:
-{total_volume:.2f} SOL
-
-👥 Holders:
-{t.holders}
-
-📈 Buy Pressure:
-{pressure}%
-
-⚡ Buys/Sells:
-{t.buy_count} / {t.sell_count}
-
-🏆 Top Holder:
-{t.top_holder:.1f}%
-
-🚀 Status:
-{migration}
-
-🔥 Alpha Score:
-{score}/10
-
-━━━━━━━━━━━━━━━
-
-📍 Contract:
-`{t.mint}`
-
-━━━━━━━━━━━━━━━
-
-🔗 Links:
-Photon • BullX • Dex
-"""
-
-# =========================================================
-
-# SEND ALERT
-
-# =========================================================
-
-async def send_alert(app, t):
-
-```
-photon = f"https://photon-sol.tinyastro.io/en/lp/{t.mint}"
-
-bullx = (
-    f"https://bullx.io/terminal"
-    f"?chainId=1399811149&address={t.mint}"
-)
-
-dex = f"https://dexscreener.com/solana/{t.mint}"
-
-keyboard = InlineKeyboardMarkup([
-
-    [
-        InlineKeyboardButton(
-            "Photon",
-            url=photon
-        ),
-
-        InlineKeyboardButton(
-            "BullX",
-            url=bullx
-        ),
-    ],
-
-    [
-        InlineKeyboardButton(
-            "Dex",
-            url=dex
-        ),
-    ]
-
-])
-
-await app.bot.send_message(
-
-    chat_id=CHAT_ID,
-
-    text=build_alert(t),
-
-    parse_mode="Markdown",
-
-    disable_web_page_preview=True,
-
-    reply_markup=keyboard,
-)
-```
-
-# =========================================================
-
-# EVENT HANDLER
-
-# =========================================================
-
-async def handle_event(app, msg):
-
-```
-tx_type = msg.get("txType")
-
-mint = msg.get("mint")
-
-if not mint:
-    return
-
-if mint not in tokens:
-
-    tokens[mint] = Token(mint=mint)
-
-t = tokens[mint]
-
-t.name = msg.get("name", t.name)
-
-t.symbol = msg.get("symbol", t.symbol)
-
-market_cap_sol = float(
-    msg.get("marketCapSol", 0)
-)
-
-t.market_cap = market_cap_sol * SOL_PRICE
-
-sol_amount = (
-    float(msg.get("solAmount", 0))
-    / 1_000_000_000
-)
-
-# ==========================================
-# BUY
-# ==========================================
-
-if tx_type == "buy":
-
-    t.buy_count += 1
-
-    t.buy_volume += sol_amount
-
-    t.sol_in += sol_amount
-
-    t.buys.append(time.time())
-
-# ==========================================
-# SELL
-# ==========================================
-
-if tx_type == "sell":
-
-    t.sell_count += 1
-
-    t.sell_volume += sol_amount
-
-# ==========================================
-# BONDING
-# ==========================================
-
-t.bonding_curve = float(
-    msg.get("bondingCurveProgress", 0)
-)
-
-# ==========================================
-# MIGRATION
-# ==========================================
-
-if msg.get("raydiumPool"):
-    t.migrated = True
-
-# ==========================================
-# HOLDERS
-# ==========================================
-
-t.holders = max(
-    t.holders,
-    int(msg.get("holderCount", 0))
-)
-
-# ==========================================
-# ALERT
-# ==========================================
-
-if not t.called and passes_filters(t):
-
-    t.called = True
-
-    log.info(
-        f"ALERT -> {t.name} "
-        f"MC=${fmt(t.market_cap)}"
+def build_alert(t: Token) -> str:
+    pressure     = buy_pressure(t)
+    total_volume = t.buy_volume + t.sell_volume
+    migration    = "🚀 Raydium" if t.migrated else "⏳ Bonding Curve"
+    score        = alpha_score(t)
+
+    # FIX: triple-quote string was malformed in original
+    return (
+        "🚨 *EARLY GEM DETECTED* 🚨\n\n"
+        f"🪙 *Token:* {t.name} ({t.symbol})\n\n"
+        f"💰 *Market Cap:* ${fmt(t.market_cap)}\n"
+        f"💧 *Liquidity:* {t.sol_in:.2f} SOL\n"
+        f"📊 *Volume:* {total_volume:.2f} SOL\n"
+        f"👥 *Holders:* {t.holders}\n"
+        f"📈 *Buy Pressure:* {pressure}%\n"
+        f"⚡ *Buys/Sells:* {t.buy_count} / {t.sell_count}\n"
+        f"🏆 *Top Holder:* {t.top_holder:.1f}%\n"
+        f"🚀 *Status:* {migration}\n"
+        f"🔥 *Alpha Score:* {score}/10\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"📍 *Contract:*\n`{t.mint}`\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "🔗 *Links:* Photon • BullX • Dex"
     )
 
-    await send_alert(app, t)
-```
-
+# =========================================================
+# SEND ALERT
 # =========================================================
 
+async def send_alert(app: Application, t: Token) -> None:
+    photon = f"https://photon-sol.tinyastro.io/en/lp/{t.mint}"
+    bullx  = f"https://bullx.io/terminal?chainId=1399811149&address={t.mint}"
+    dex    = f"https://dexscreener.com/solana/{t.mint}"
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Photon", url=photon),
+            InlineKeyboardButton("BullX",  url=bullx),
+        ],
+        [
+            InlineKeyboardButton("Dex", url=dex),
+        ],
+    ])
+
+    await app.bot.send_message(
+        chat_id=CHAT_ID,
+        text=build_alert(t),
+        parse_mode="Markdown",
+        disable_web_page_preview=True,
+        reply_markup=keyboard,
+    )
+
+# =========================================================
+# EVENT HANDLER
+# =========================================================
+
+async def handle_event(app: Application, msg: dict) -> None:
+    tx_type = msg.get("txType")
+    mint    = msg.get("mint")
+
+    if not mint:
+        return
+
+    if mint not in tokens:
+        tokens[mint] = Token(mint=mint)
+
+    t = tokens[mint]
+
+    # Update name/symbol if provided
+    t.name   = msg.get("name",   t.name)
+    t.symbol = msg.get("symbol", t.symbol)
+
+    # Market cap
+    market_cap_sol = float(msg.get("marketCapSol", 0))
+    t.market_cap   = market_cap_sol * SOL_PRICE
+
+    # FIX: pump.fun sends solAmount already in SOL (not lamports).
+    # Original code divided by 1_000_000_000, producing near-zero values
+    # and silently breaking the MIN_SOL_IN filter.
+    sol_amount = float(msg.get("solAmount", 0))
+
+    # ----------------------------------------------------------
+    if tx_type == "buy":
+        t.buy_count  += 1
+        t.buy_volume += sol_amount
+        t.sol_in     += sol_amount
+        t.buys.append(time.time())
+
+    elif tx_type == "sell":
+        t.sell_count  += 1
+        t.sell_volume += sol_amount
+    # ----------------------------------------------------------
+
+    # Bonding curve progress
+    t.bonding_curve = float(msg.get("bondingCurveProgress", 0))
+
+    # Migration flag
+    if msg.get("raydiumPool"):
+        t.migrated = True
+
+    # Holders — safe default to avoid overwriting a higher value with 0
+    holder_count = int(msg.get("holderCount", 0))
+    if holder_count:
+        t.holders = max(t.holders, holder_count)
+
+    # Top holder percentage (not always present in trade events)
+    top_holder = float(msg.get("topHolder", 0))
+    if top_holder:
+        t.top_holder = top_holder
+
+    # Fire alert once when all filters pass
+    if not t.called and passes_filters(t):
+        t.called = True
+        log.info(f"ALERT -> {t.name} ({t.symbol}) | MC=${fmt(t.market_cap)}")
+        await send_alert(app, t)
+
+# =========================================================
 # WEBSOCKET LOOP
-
 # =========================================================
 
-async def websocket_loop(app):
+async def websocket_loop(app: Application) -> None:
+    while True:
+        try:
+            async with websockets.connect(
+                PUMP_WS,
+                ping_interval=20,
+                ping_timeout=20,
+            ) as ws:
+                log.info("Connected to pump.fun WebSocket")
 
-```
-while True:
+                await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                await ws.send(json.dumps({"method": "subscribeTokenTrade"}))
 
-    try:
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                        await handle_event(app, msg)
+                    except Exception as e:
+                        log.error(f"Event handling error: {e}")
 
-        async with websockets.connect(
-            PUMP_WS,
-            ping_interval=20,
-            ping_timeout=20,
-        ) as ws:
-
-            log.info("Connected to pump.fun")
-
-            await ws.send(json.dumps({
-
-                "method": "subscribeNewToken"
-
-            }))
-
-            await ws.send(json.dumps({
-
-                "method": "subscribeTokenTrade"
-
-            }))
-
-            async for raw in ws:
-
-                try:
-
-                    msg = json.loads(raw)
-
-                    await handle_event(app, msg)
-
-                except Exception as e:
-
-                    log.error(e)
-
-    except Exception as e:
-
-        log.error(f"WS reconnect: {e}")
-
-        await asyncio.sleep(5)
-```
+        except Exception as e:
+            log.error(f"WebSocket disconnected: {e} — reconnecting in 5s")
+            await asyncio.sleep(5)
 
 # =========================================================
-
-# STARTUP
-
+# STARTUP HOOK
 # =========================================================
 
-async def post_init(app):
-
-```
-asyncio.create_task(
-    websocket_loop(app)
-)
-```
+async def post_init(app: Application) -> None:
+    asyncio.create_task(websocket_loop(app))
 
 # =========================================================
-
-# MAIN
-
+# ENTRY POINT
 # =========================================================
 
-def main():
+def main() -> None:
+    if not TG_TOKEN:
+        raise RuntimeError("TELEGRAM_BOT_TOKEN env var is not set")
+    if not CHAT_ID:
+        raise RuntimeError("CHAT_ID env var is not set")
 
-```
-app = (
-    Application
-    .builder()
-    .token(TG_TOKEN)
-    .build()
-)
+    app = Application.builder().token(TG_TOKEN).build()
+    app.post_init = post_init
 
-app.post_init = post_init
+    log.info("GemStalker started")
+    app.run_polling(drop_pending_updates=True)
 
-log.info("GemStalker started")
 
-app.run_polling(
-    drop_pending_updates=True
-)
-```
-
-if **name** == "**main**":
-
-```
-main()
-```
+if __name__ == "__main__":  # FIX: was **name** == "**main**" (broken dunders)
+    main()

@@ -83,10 +83,10 @@ flask_app              = Flask(__name__)
 
 @flask_app.route("/")
 def health():
-return {"status": "alive", "calls": len(call_history)}
+    return {"status": "alive", "calls": len(call_history)}
 
 def run_flask():
-flask_app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+    flask_app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
 
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -95,15 +95,15 @@ flask_app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
 # ════════════════════════════════════════════════════════════════════════════
 
 def fmt(n: float, decimals: int = 2) -> str:
-if n is None:
-return "?"
-if n >= 1_000_000_000:
-return f"{n/1_000_000_000:.{decimals}f}B"
-if n >= 1_000_000:
-return f"{n/1_000_000:.{decimals}f}M"
-if n >= 1_000:
-return f"{n/1_000:.{decimals}f}K"
-return f"{n:.{decimals}f}"
+    if n is None:
+        return "?"
+        if n >= 1_000_000_000:
+            return f"{n/1_000_000_000:.{decimals}f}B"
+            if n >= 1_000_000:
+                return f"{n/1_000_000:.{decimals}f}M"
+                if n >= 1_000:
+                    return f"{n/1_000:.{decimals}f}K"
+                    return f"{n:.{decimals}f}"
 
 def age_str(created_ts_ms) -> str:
 if not created_ts_ms:

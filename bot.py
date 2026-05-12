@@ -134,6 +134,21 @@ async def fetch(url: str, json_body: dict = None):
         logger.debug(f"fetch failed {url}: {e}")
         return None
 
+def clean_addr(addr: str) -> str:
+    """
+    Strip any trailing 'pump' suffix that pump.fun appends to addresses
+    in some API responses (e.g. 'ABC...XYZpump' → 'ABC...XYZ').
+    Also strips whitespace and null bytes.
+    Solana addresses are base58, 32–44 chars, no lowercase L or 0 or O or I.
+    """
+    if not addr:
+        return addr
+    addr = addr.strip()
+    # pump.fun appends the literal word 'pump' to mint addresses in some endpoints
+    if addr.endswith("pump"):
+        addr = addr[:-4]
+    return addr
+
 # ════════════════════════════════════════════════════════════════════════════
 # DATA FETCHING
 # ════════════════════════════════════════════════════════════════════════════
@@ -653,7 +668,7 @@ async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not args:
         await update.message.reply_text("Usage: `/scan <CA>`", parse_mode="Markdown")
         return
-    ca  = args[0].strip()
+    ca  = clean_addr(args[0].strip())
     msg = await update.message.reply_text("🔍 Analysing…")
     dex, pump, holders, fees, score, notes, lp_usd = await analyse(ca)
     if not dex:
@@ -743,7 +758,7 @@ async def pnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text("Usage: `/pnl <CA>`", parse_mode="Markdown")
         return ConversationHandler.END
 
-    ca  = args[0].strip()
+    ca  = clean_addr(args[0].strip())
     uid = update.effective_user.id
 
     # look up in call history first
@@ -844,7 +859,7 @@ async def pnl_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = update.message.text.strip()
+    text = clean_addr(update.message.text.strip())
     if re.match(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$", text) or re.match(r"^0x[0-9a-fA-F]{40}$", text):
         context.args = [text]
         await scan_cmd(update, context)
@@ -865,19 +880,19 @@ async def stream_loop(app):
             profiles = await fetch(DEX_PROFILES)
             if isinstance(profiles, list):
                 for p in profiles:
-                    a = p.get("tokenAddress") or p.get("address")
+                    a = clean_addr(p.get("tokenAddress") or p.get("address"))
                     if a: addresses.add(a)
 
             boosts = await fetch(DEX_BOOSTS)
             if isinstance(boosts, list):
                 for b in boosts:
-                    a = b.get("tokenAddress") or b.get("address")
+                    a = clean_addr(b.get("tokenAddress") or b.get("address"))
                     if a: addresses.add(a)
 
             pump_list = await fetch(PUMP_COINS)
             if isinstance(pump_list, list):
                 for coin in pump_list:
-                    a = coin.get("mint")
+                    a = clean_addr(coin.get("mint"))
                     if a: addresses.add(a)
 
             fresh = [a for a in addresses if a not in seen_tokens]

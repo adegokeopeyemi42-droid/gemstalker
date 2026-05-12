@@ -531,7 +531,7 @@ if not args:
 await update.message.reply_text(“Usage: `/scan <CA>`”, parse_mode=“Markdown”)
 return
 ca  = args[0].strip()
-msg = await update.message.reply_text(“🔍 Analysing…”)
+msg = await update.message.reply_text(“🔍 Analysing...”)
 dex, pump, holders, fees, score, notes = await analyse(ca)
 if not dex:
 await msg.edit_text(“❌ Token not found on DexScreener.”)
@@ -618,7 +618,7 @@ photo_file = await update.message.photo[-1].get_file()
 photo_bytes = await photo_file.download_as_bytearray()
 dex, _, _, _, _, _ = await analyse(record[“address”])
 current_mc = dex[“mc”] if dex else record[“mc”]
-msg = await update.message.reply_text(“🎨 Generating card…”)
+msg = await update.message.reply_text(“🎨 Generating card...”)
 try:
 buf = make_pnl_card(
 bg_bytes=bytes(photo_bytes), name=record[“name”], symbol=record[“symbol”],

@@ -25,26 +25,26 @@ filters,
 # ── logging ───────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
-format=”%(asctime)s | %(levelname)s | %(message)s”,
+format="%(asctime)s | %(levelname)s | %(message)s",
 level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
 # ── env ───────────────────────────────────────────────────────────────────────
 
-TOKEN   = os.getenv(“TELEGRAM_BOT_TOKEN”)
-CHAT_ID = os.getenv(“CHAT_ID”)
+TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
 # ── api endpoints ─────────────────────────────────────────────────────────────
 
-DEX_PROFILES  = “https://api.dexscreener.com/token-profiles/latest/v1”
-DEX_BOOSTS    = “https://api.dexscreener.com/token-boosts/latest/v1”
-DEX_TOKEN     = “https://api.dexscreener.com/latest/dex/tokens/”
-PUMP_COINS    = “https://frontend-api.pump.fun/coins?limit=50&sort=created_timestamp&order=DESC”
-PUMP_TOKEN    = “https://frontend-api.pump.fun/coins/”
-SOLSCAN_TOKEN = “https://public-api.solscan.io/token/holders?tokenAddress=”
-SOLSCAN_META  = “https://public-api.solscan.io/token/meta?tokenAddress=”
-SOL_RPC       = “https://api.mainnet-beta.solana.com”
+DEX_PROFILES  = "https://api.dexscreener.com/token-profiles/latest/v1"
+DEX_BOOSTS    = "https://api.dexscreener.com/token-boosts/latest/v1"
+DEX_TOKEN     = "https://api.dexscreener.com/latest/dex/tokens/"
+PUMP_COINS    = "https://frontend-api.pump.fun/coins?limit=50&sort=created_timestamp&order=DESC"
+PUMP_TOKEN    = "https://frontend-api.pump.fun/coins/"
+SOLSCAN_TOKEN = "https://public-api.solscan.io/token/holders?tokenAddress="
+SOLSCAN_META  = "https://public-api.solscan.io/token/meta?tokenAddress="
+SOL_RPC       = "https://api.mainnet-beta.solana.com"
 
 # ── filters (from your PDF) ───────────────────────────────────────────────────
 
@@ -81,12 +81,12 @@ flask_app              = Flask(__name__)
 
 # ════════════════════════════════════════════════════════════════════════════
 
-@flask_app.route(”/”)
+@flask_app.route("/")
 def health():
-return {“status”: “alive”, “calls”: len(call_history)}
+return {"status": "alive", "calls": len(call_history)}
 
 def run_flask():
-flask_app.run(host=“0.0.0.0”, port=int(os.getenv(“PORT”, 8080)))
+flask_app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
 
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -96,23 +96,23 @@ flask_app.run(host=“0.0.0.0”, port=int(os.getenv(“PORT”, 8080)))
 
 def fmt(n: float, decimals: int = 2) -> str:
 if n is None:
-return “?”
+return "?"
 if n >= 1_000_000_000:
-return f”{n/1_000_000_000:.{decimals}f}B”
+return f"{n/1_000_000_000:.{decimals}f}B"
 if n >= 1_000_000:
-return f”{n/1_000_000:.{decimals}f}M”
+return f"{n/1_000_000:.{decimals}f}M"
 if n >= 1_000:
-return f”{n/1_000:.{decimals}f}K”
-return f”{n:.{decimals}f}”
+return f"{n/1_000:.{decimals}f}K"
+return f"{n:.{decimals}f}"
 
 def age_str(created_ts_ms) -> str:
 if not created_ts_ms:
-return “?”
+return "?"
 secs = time.time() - created_ts_ms / 1000
-if secs < 60:   return f”{int(secs)}s”
-if secs < 3600: return f”{int(secs/60)}m”
-if secs < 86400:return f”{secs/3600:.1f}h”
-return f”{secs/86400:.1f}d”
+if secs < 60:   return f"{int(secs)}s"
+if secs < 3600: return f"{int(secs/60)}m"
+if secs < 86400:return f"{secs/3600:.1f}h"
+return f"{secs/86400:.1f}d"
 
 def since_str(ts: float) -> str:
 return age_str(ts * 1000)
@@ -126,7 +126,7 @@ r = await http.get(url)
 r.raise_for_status()
 return r.json()
 except Exception as e:
-logger.debug(f”fetch failed {url}: {e}”)
+logger.debug(f"fetch failed {url}: {e}")
 return None
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -139,37 +139,37 @@ async def get_dex_data(address: str):
 data = await fetch(DEX_TOKEN + address)
 if not data:
 return None
-pairs = data.get(“pairs”) or []
+pairs = data.get("pairs") or []
 if not pairs:
 return None
 p    = pairs[0]
-base = p.get(“baseToken”, {})
-info = p.get(“info”, {})
+base = p.get("baseToken", {})
+info = p.get("info", {})
 return {
-“address”  : address,
-“name”     : base.get(“name”, “Unknown”),
-“symbol”   : base.get(“symbol”, “?”),
-“price”    : float(p.get(“priceUsd”) or 0),
-“mc”       : float(p.get(“fdv”) or 0),
-“lp”       : float((p.get(“liquidity”) or {}).get(“usd”) or 0),
-“vol_5m”   : float((p.get(“volume”) or {}).get(“m5”) or 0),
-“vol_1h”   : float((p.get(“volume”) or {}).get(“h1”) or 0),
-“vol_24h”  : float((p.get(“volume”) or {}).get(“h24”) or 0),
-“buys_5m”  : int((p.get(“txns”) or {}).get(“m5”, {}).get(“buys”) or 0),
-“sells_5m” : int((p.get(“txns”) or {}).get(“m5”, {}).get(“sells”) or 0),
-“buys_1h”  : int((p.get(“txns”) or {}).get(“h1”, {}).get(“buys”) or 0),
-“sells_1h” : int((p.get(“txns”) or {}).get(“h1”, {}).get(“sells”) or 0),
-“chain”    : p.get(“chainId”, “solana”),
-“dex”      : p.get(“dexId”, “?”),
-“pair_age” : age_str(p.get(“pairCreatedAt”)),
-“pair_ts”  : p.get(“pairCreatedAt”),
-“url”      : p.get(“url”, “”),
-“socials”  : info.get(“socials”, []),
-“websites” : info.get(“websites”, []),
-“has_social”: bool(info.get(“socials”) or info.get(“websites”)),
-“dex_paid” : bool(info.get(“header”) or info.get(“openGraph”)),
-“price_1h” : float((p.get(“priceChange”) or {}).get(“h1”) or 0),
-“price_24h”: float((p.get(“priceChange”) or {}).get(“h24”) or 0),
+"address"  : address,
+"name"     : base.get("name", "Unknown"),
+"symbol"   : base.get("symbol", "?"),
+"price"    : float(p.get("priceUsd") or 0),
+"mc"       : float(p.get("fdv") or 0),
+"lp"       : float((p.get("liquidity") or {}).get("usd") or 0),
+"vol_5m"   : float((p.get("volume") or {}).get("m5") or 0),
+"vol_1h"   : float((p.get("volume") or {}).get("h1") or 0),
+"vol_24h"  : float((p.get("volume") or {}).get("h24") or 0),
+"buys_5m"  : int((p.get("txns") or {}).get("m5", {}).get("buys") or 0),
+"sells_5m" : int((p.get("txns") or {}).get("m5", {}).get("sells") or 0),
+"buys_1h"  : int((p.get("txns") or {}).get("h1", {}).get("buys") or 0),
+"sells_1h" : int((p.get("txns") or {}).get("h1", {}).get("sells") or 0),
+"chain"    : p.get("chainId", "solana"),
+"dex"      : p.get("dexId", "?"),
+"pair_age" : age_str(p.get("pairCreatedAt")),
+"pair_ts"  : p.get("pairCreatedAt"),
+"url"      : p.get("url", ""),
+"socials"  : info.get("socials", []),
+"websites" : info.get("websites", []),
+"has_social": bool(info.get("socials") or info.get("websites")),
+"dex_paid" : bool(info.get("header") or info.get("openGraph")),
+"price_1h" : float((p.get("priceChange") or {}).get("h1") or 0),
+"price_24h": float((p.get("priceChange") or {}).get("h24") or 0),
 }
 
 async def get_pump_data(address: str):
@@ -177,71 +177,71 @@ data = await fetch(PUMP_TOKEN + address)
 if not data:
 return None
 return {
-“migration”    : data.get(“raydium_pool”) is not None,
-“bonding_curve”: float(data.get(“bonding_curve_percentage”) or 0),
-“dev_holding”  : float(data.get(“creator_percentage”) or 0),
-“total_supply” : float(data.get(“total_supply”) or 0),
-“twitter”      : data.get(“twitter”, “”),
-“telegram”     : data.get(“telegram”, “”),
-“website”      : data.get(“website”, “”),
+"migration"    : data.get("raydium_pool") is not None,
+"bonding_curve": float(data.get("bonding_curve_percentage") or 0),
+"dev_holding"  : float(data.get("creator_percentage") or 0),
+"total_supply" : float(data.get("total_supply") or 0),
+"twitter"      : data.get("twitter", ""),
+"telegram"     : data.get("telegram", ""),
+"website"      : data.get("website", ""),
 }
 
 async def get_holders(address: str) -> dict:
-result = {“top10_pct”: None, “holder_count”: None, “top_holders”: []}
-data = await fetch(f”{SOLSCAN_TOKEN}{address}&limit=10&offset=0”)
+result = {"top10_pct": None, "holder_count": None, "top_holders": []}
+data = await fetch(f"{SOLSCAN_TOKEN}{address}&limit=10&offset=0")
 if not data:
 return result
-holders = data.get(“data”, [])
-total   = data.get(“total”)
+holders = data.get("data", [])
+total   = data.get("total")
 if not holders:
 return result
-supply_data = await fetch(f”{SOLSCAN_META}{address}”)
-supply = float((supply_data or {}).get(“supply”) or 0)
+supply_data = await fetch(f"{SOLSCAN_META}{address}")
+supply = float((supply_data or {}).get("supply") or 0)
 if supply:
-top10_sum = sum(float(h.get(“amount”) or 0) for h in holders)
-result[“top10_pct”]   = round((top10_sum / supply) * 100, 1)
-result[“top_holders”] = [
-round((float(h.get(“amount”) or 0) / supply) * 100, 2)
+top10_sum = sum(float(h.get("amount") or 0) for h in holders)
+result["top10_pct"]   = round((top10_sum / supply) * 100, 1)
+result["top_holders"] = [
+round((float(h.get("amount") or 0) / supply) * 100, 2)
 for h in holders[:5]
 ]
-result[“holder_count”] = total
+result["holder_count"] = total
 return result
 
 async def get_fees_paid(address: str) -> float:
 try:
 payload = {
-“jsonrpc”: “2.0”, “id”: 1,
-“method”: “getSignaturesForAddress”,
-“params”: [address, {“limit”: 10}],
+"jsonrpc": "2.0", "id": 1,
+"method": "getSignaturesForAddress",
+"params": [address, {"limit": 10}],
 }
 data = await fetch(SOL_RPC, json_body=payload)
 if not data:
 return 0.0
 total = 0.0
-for sig_info in (data.get(“result”) or [])[:5]:
-sig = sig_info.get(“signature”)
+for sig_info in (data.get("result") or [])[:5]:
+sig = sig_info.get("signature")
 tx  = await fetch(SOL_RPC, json_body={
-“jsonrpc”: “2.0”, “id”: 1,
-“method”: “getTransaction”,
-“params”: [sig, {“encoding”: “json”, “maxSupportedTransactionVersion”: 0}],
+"jsonrpc": "2.0", "id": 1,
+"method": "getTransaction",
+"params": [sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}],
 })
-if tx and tx.get(“result”):
-total += tx[“result”].get(“meta”, {}).get(“fee”, 0) / 1e9
+if tx and tx.get("result"):
+total += tx["result"].get("meta", {}).get("fee", 0) / 1e9
 return round(total, 4)
 except Exception as e:
-logger.debug(f”get_fees_paid: {e}”)
+logger.debug(f"get_fees_paid: {e}")
 return 0.0
 
 async def get_smart_wallets(address: str) -> int:
-data = await fetch(f”{SOLSCAN_TOKEN}{address}&limit=20&offset=0”)
+data = await fetch(f"{SOLSCAN_TOKEN}{address}&limit=20&offset=0")
 if not data:
 return 0
-holders     = data.get(“data”, [])
-supply_data = await fetch(f”{SOLSCAN_META}{address}”)
-supply      = float((supply_data or {}).get(“supply”) or 0)
+holders     = data.get("data", [])
+supply_data = await fetch(f"{SOLSCAN_META}{address}")
+supply      = float((supply_data or {}).get("supply") or 0)
 if not supply:
 return 0
-return sum(1 for h in holders if (float(h.get(“amount”) or 0) / supply) * 100 >= 1)
+return sum(1 for h in holders if (float(h.get("amount") or 0) / supply) * 100 >= 1)
 
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -339,11 +339,11 @@ return min(score, 100), notes
 # ════════════════════════════════════════════════════════════════════════════
 
 def passes_filters(dex: dict, pump, holders: dict, fees: float) -> tuple:
-mc    = dex[“mc”]
-lp    = dex[“lp”]
-top10 = holders.get(“top10_pct”)
-hc    = holders.get(“holder_count”) or 0
-dev_h = pump.get(“dev_holding”) if pump else None
+mc    = dex["mc"]
+lp    = dex["lp"]
+top10 = holders.get("top10_pct")
+hc    = holders.get("holder_count") or 0
+dev_h = pump.get("dev_holding") if pump else None
 
 ```
 if not (F_MC_MIN <= mc <= F_MC_MAX):
@@ -373,17 +373,17 @@ return True, "ok"
 
 # ════════════════════════════════════════════════════════════════════════════
 
-def build_alert(dex: dict, pump, holders: dict, fees: float, score: int, tag: str = “🔥 HIGH SCORE CALL”) -> str:
-addr     = dex[“address”]
-top10    = holders.get(“top10_pct”, “?”)
-top_h    = holders.get(“top_holders”, [])
-hcount   = holders.get(“holder_count”, “?”)
-dev_h    = f”{pump.get(‘dev_holding’, ‘?’):.1f}” if pump and pump.get(“dev_holding”) is not None else “?”
-migrated = pump.get(“migration”, False) if pump else False
-bc       = pump.get(“bonding_curve”, 0) if pump else 0
-twitter  = (pump.get(“twitter”) if pump else “”) or “”
-tg       = (pump.get(“telegram”) if pump else “”) or “”
-web      = (pump.get(“website”) if pump else “”) or “”
+def build_alert(dex: dict, pump, holders: dict, fees: float, score: int, tag: str = "🔥 HIGH SCORE CALL") -> str:
+addr     = dex["address"]
+top10    = holders.get("top10_pct", "?")
+top_h    = holders.get("top_holders", [])
+hcount   = holders.get("holder_count", "?")
+dev_h    = f"{pump.get('dev_holding', '?'):.1f}" if pump and pump.get("dev_holding") is not None else "?"
+migrated = pump.get("migration", False) if pump else False
+bc       = pump.get("bonding_curve", 0) if pump else 0
+twitter  = (pump.get("twitter") if pump else "") or ""
+tg       = (pump.get("telegram") if pump else "") or ""
+web      = (pump.get("website") if pump else "") or ""
 
 ```
 soc_parts = []
@@ -454,7 +454,7 @@ return dex, pump, holders, fees, score, notes
 
 def make_pnl_card(bg_bytes: bytes, name: str, symbol: str,
 called_mc: float, current_mc: float, called_at_ts: float) -> io.BytesIO:
-bg = Image.open(io.BytesIO(bg_bytes)).convert(“RGBA”)
+bg = Image.open(io.BytesIO(bg_bytes)).convert("RGBA")
 bg = bg.resize((800, 450), Image.LANCZOS)
 
 ```
@@ -504,53 +504,53 @@ return buf
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 await update.message.reply_text(
-“🚀 *Alpha Scanner Bot*\n\n”
-“📡 *Tracking:*\n”
-“• New Pairs\n”
-“• Pump.fun Migrations\n”
-“• Smart Money Buys\n\n”
-“🔽 *Filters:*\n”
-“• MCAP: $5k–$50k\n”
-“• LP > $4k\n”
-“• Top 10 < 35%\n”
-“• Dev Holding ≤ 1%\n”
-“• Vol > $6k · Holders ≥ 20\n”
-“• Requires Socials\n\n”
-“📋 *Commands:*\n”
-“`/calls` — all calls\n”
-“`/calls 1h` · `/calls 6h` · `/calls 1d` · `/calls 7d`\n”
-“`/scan <CA>` — deep scan + insights\n”
-“`/pnl <CA>` — PNL card generator\n”
-“`/status` — bot stats”,
-parse_mode=“Markdown”,
+"🚀 *Alpha Scanner Bot*\n\n"
+"📡 *Tracking:*\n"
+"• New Pairs\n"
+"• Pump.fun Migrations\n"
+"• Smart Money Buys\n\n"
+"🔽 *Filters:*\n"
+"• MCAP: $5k–$50k\n"
+"• LP > $4k\n"
+"• Top 10 < 35%\n"
+"• Dev Holding ≤ 1%\n"
+"• Vol > $6k · Holders ≥ 20\n"
+"• Requires Socials\n\n"
+"📋 *Commands:*\n"
+"`/calls` — all calls\n"
+"`/calls 1h` · `/calls 6h` · `/calls 1d` · `/calls 7d`\n"
+"`/scan <CA>` — deep scan + insights\n"
+"`/pnl <CA>` — PNL card generator\n"
+"`/status` — bot stats",
+parse_mode="Markdown",
 )
 
 async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 args = context.args
 if not args:
-await update.message.reply_text(“Usage: `/scan <CA>`”, parse_mode=“Markdown”)
+await update.message.reply_text("Usage: `/scan <CA>`", parse_mode="Markdown")
 return
 ca  = args[0].strip()
-msg = await update.message.reply_text(“🔍 Analysing...”)
+msg = await update.message.reply_text("🔍 Analysing...")
 dex, pump, holders, fees, score, notes = await analyse(ca)
 if not dex:
-await msg.edit_text(“❌ Token not found on DexScreener.”)
+await msg.edit_text("❌ Token not found on DexScreener.")
 return
 passed, reason = passes_filters(dex, pump, holders, fees)
 alert   = build_alert(dex, pump, holders, fees, score,
-tag=“✅ PASSES FILTERS” if passed else f”⚠️ FILTERED — {reason}”)
-insight = “\n”.join(f”  {n}” for n in notes)
+tag="✅ PASSES FILTERS" if passed else f"⚠️ FILTERED — {reason}")
+insight = "\n".join(f"  {n}" for n in notes)
 await msg.edit_text(
-alert + f”\n\n💡 *Insights:*\n{insight}”,
-parse_mode=“Markdown”,
+alert + f"\n\n💡 *Insights:*\n{insight}",
+parse_mode="Markdown",
 disable_web_page_preview=True,
 )
 
 async def calls_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-windows = {“1h”: 3600, “6h”: 21600, “12h”: 43200, “1d”: 86400, “7d”: 604800}
+windows = {"1h": 3600, "6h": 21600, "12h": 43200, "1d": 86400, "7d": 604800}
 args    = context.args
 window  = None
-label   = “all time”
+label   = "all time"
 if args and args[0].lower() in windows:
 window = windows[args[0].lower()]
 label  = args[0].lower()
@@ -576,12 +576,12 @@ await update.message.reply_text(
 async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 uptime = str(datetime.timedelta(seconds=int(time.time() - bot_start_time)))
 await update.message.reply_text(
-f”✅ *GemStalker Status*\n”
-f”⏱ Uptime: `{uptime}`\n”
-f”👁 Seen: `{len(seen_tokens)}` tokens\n”
-f”📣 Calls: `{len(call_history)}`\n”
-f”🔴 Stream: live (no 20s delay)”,
-parse_mode=“Markdown”,
+f"✅ *GemStalker Status*\n"
+f"⏱ Uptime: `{uptime}`\n"
+f"👁 Seen: `{len(seen_tokens)}` tokens\n"
+f"📣 Calls: `{len(call_history)}`\n"
+f"🔴 Stream: live (no 20s delay)",
+parse_mode="Markdown",
 )
 
 # ── /pnl flow ────────────────────────────────────────────────────────────────
@@ -589,22 +589,22 @@ parse_mode=“Markdown”,
 async def pnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 args = context.args
 if not args:
-await update.message.reply_text(“Usage: `/pnl <CA>`”, parse_mode=“Markdown”)
+await update.message.reply_text("Usage: `/pnl <CA>`", parse_mode="Markdown")
 return ConversationHandler.END
 ca  = args[0].strip()
 uid = update.effective_user.id
-record = next((c for c in call_history if c[“address”] == ca), None)
+record = next((c for c in call_history if c["address"] == ca), None)
 if not record:
 dex, _, _, _, score, _ = await analyse(ca)
 if not dex:
-await update.message.reply_text(“❌ Token not found.”)
+await update.message.reply_text("❌ Token not found.")
 return ConversationHandler.END
-record = {“address”: ca, “name”: dex[“name”], “symbol”: dex[“symbol”],
-“mc”: dex[“mc”], “price”: dex[“price”], “ts”: time.time(), “score”: score}
-pnl_pending[uid] = {“ca”: ca, “record”: record}
+record = {"address": ca, "name": dex["name"], "symbol": dex["symbol"],
+"mc": dex["mc"], "price": dex["price"], "ts": time.time(), "score": score}
+pnl_pending[uid] = {"ca": ca, "record": record}
 await update.message.reply_text(
-f”📸 Send me the background image you want for your *{record[‘name’]}* PNL card.”,
-parse_mode=“Markdown”,
+f"📸 Send me the background image you want for your *{record['name']}* PNL card.",
+parse_mode="Markdown",
 )
 return WAIT_PHOTO
 
@@ -613,40 +613,40 @@ uid = update.effective_user.id
 if uid not in pnl_pending:
 return ConversationHandler.END
 pending    = pnl_pending.pop(uid)
-record     = pending[“record”]
+record     = pending["record"]
 photo_file = await update.message.photo[-1].get_file()
 photo_bytes = await photo_file.download_as_bytearray()
-dex, _, _, _, _, _ = await analyse(record[“address”])
-current_mc = dex[“mc”] if dex else record[“mc”]
-msg = await update.message.reply_text(“🎨 Generating card...”)
+dex, _, _, _, _, _ = await analyse(record["address"])
+current_mc = dex["mc"] if dex else record["mc"]
+msg = await update.message.reply_text("🎨 Generating card...")
 try:
 buf = make_pnl_card(
-bg_bytes=bytes(photo_bytes), name=record[“name”], symbol=record[“symbol”],
-called_mc=record[“mc”], current_mc=current_mc, called_at_ts=record[“ts”],
+bg_bytes=bytes(photo_bytes), name=record["name"], symbol=record["symbol"],
+called_mc=record["mc"], current_mc=current_mc, called_at_ts=record["ts"],
 )
 await update.message.reply_photo(
 photo=buf,
-caption=f”🚀 *{record[‘name’]}* PNL Card\nCalled at `${fmt(record['mc'])}` MC”,
-parse_mode=“Markdown”,
+caption=f"🚀 *{record['name']}* PNL Card\nCalled at `${fmt(record['mc'])}` MC",
+parse_mode="Markdown",
 )
 await msg.delete()
 except Exception as e:
-logger.error(f”pnl_photo error: {e}”)
-await msg.edit_text(“❌ Failed to generate card. Try a different image.”)
+logger.error(f"pnl_photo error: {e}")
+await msg.edit_text("❌ Failed to generate card. Try a different image.")
 return ConversationHandler.END
 
 async def pnl_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 pnl_pending.pop(update.effective_user.id, None)
-await update.message.reply_text(“Cancelled.”)
+await update.message.reply_text("Cancelled.")
 return ConversationHandler.END
 
 async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 text = update.message.text.strip()
-if re.match(r”^[1-9A-HJ-NP-Za-km-z]{32,44}$”, text) or re.match(r”^0x[0-9a-fA-F]{40}$”, text):
+if re.match(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$", text) or re.match(r"^0x[0-9a-fA-F]{40}$", text):
 context.args = [text]
 await scan_cmd(update, context)
 else:
-await update.message.reply_text(“Send a contract address or use /scan <CA>.”)
+await update.message.reply_text("Send a contract address or use /scan <CA>.")
 
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -655,7 +655,7 @@ await update.message.reply_text(“Send a contract address or use /scan <CA>.”
 # ════════════════════════════════════════════════════════════════════════════
 
 async def stream_loop(app):
-logger.info(“Stream loop started — listening for new tokens”)
+logger.info("Stream loop started — listening for new tokens")
 while True:
 try:
 addresses = set()
@@ -724,10 +724,10 @@ addresses = set()
 async def check_milestones(app):
 now = time.time()
 for addr, info in list(seen_tokens.items()):
-if “mc” not in info or not info.get(“next_milestone”):
+if "mc" not in info or not info.get("next_milestone"):
 continue
-if now - info.get(“ts”, 0) > 172800:   # stop tracking after 48h
-info[“next_milestone”] = None
+if now - info.get("ts", 0) > 172800:   # stop tracking after 48h
+info["next_milestone"] = None
 continue
 
 ```
@@ -770,7 +770,7 @@ continue
 
 def main():
 threading.Thread(target=run_flask, daemon=True).start()
-logger.info(“Flask started”)
+logger.info("Flask started")
 
 ```
 app = Application.builder().token(TOKEN).build()
@@ -800,5 +800,5 @@ logger.info("GemStalker live")
 app.run_polling(drop_pending_updates=True)
 ```
 
-if __name__ == “__main__”:
+if __name__ == "__main__":
 main()

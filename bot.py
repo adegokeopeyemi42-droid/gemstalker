@@ -3,8 +3,10 @@ import time
 import json
 import asyncio
 import logging
+import threading
 from dataclasses import dataclass, field
 from collections import deque
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import websockets
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
@@ -281,6 +283,26 @@ async def post_init(app: Application) -> None:
     asyncio.create_task(websocket_loop(app))
 
 # =========================================================
+# HEALTH SERVER (keeps Render Web Service happy)
+# =========================================================
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass  # silence HTTP logs from flooding the console
+
+
+def run_health_server() -> None:
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    log.info(f"Health server listening on port {port}")
+    server.serve_forever()
+
+# =========================================================
 # ENTRY POINT
 # =========================================================
 
@@ -289,6 +311,9 @@ def main() -> None:
         raise RuntimeError("TELEGRAM_BOT_TOKEN env var is not set")
     if not CHAT_ID:
         raise RuntimeError("CHAT_ID env var is not set")
+
+    # Start health server in background so Render detects an open port
+    threading.Thread(target=run_health_server, daemon=True).start()
 
     app = Application.builder().token(TG_TOKEN).build()
     app.post_init = post_init

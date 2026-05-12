@@ -1,1040 +1,966 @@
-import os
-import re
-import io
-import time
-import json
-import asyncio
-import logging
-import datetime
-import threading
-from collections import deque
-from PIL import Image, ImageDraw, ImageFont
+"""
+GemStalker — Pre-Migration Bonding Curve Scanner
+=================================================
+Architecture:
+  • pump.fun WebSocket  → real-time trade/mint events on bonding curve
+  • Helius WebSocket    → on-chain logs, Raydium migration detection
+  • pump.fun REST API   → enrich token metadata after first event
+  • RugCheck API        → mint/freeze authority + bundle/sniper checks
+  • DexScreener REST    → ONLY used post-migration for Raydium LP data
+  • Solscan REST        → holder distribution
+
+Alerts fire when a bonding-curve token passes ALL filters.
+Milestones fire at 2x, 5x, 10x, 25x, 50x, 100x from call MC only.
+"""
+
+import os, re, io, time, json, asyncio, logging, datetime, threading
+from collections   import deque
+from dataclasses   import dataclass, field
+from typing        import Optional
 
 import httpx
-from flask import Flask
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ConversationHandler,
-    ContextTypes,
-    filters,
+import websockets
+from PIL            import Image, ImageDraw, ImageFont
+from flask          import Flask
+from telegram       import Update
+from telegram.ext   import (
+    Application, CommandHandler, MessageHandler,
+    ConversationHandler, ContextTypes, filters as tg_filters,
 )
 
-# ── logging ───────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════════════════════════════════════════════
 
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
+log = logging.getLogger(__name__)
 
-# ── env ───────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENV / KEYS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+TG_TOKEN       = os.getenv("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID        = os.getenv("CHAT_ID", "")
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "")          # free at helius.dev
 
-# ── api endpoints ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# WEBSOCKET ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-DEX_PROFILES  = "https://api.dexscreener.com/token-profiles/latest/v1"
-DEX_BOOSTS    = "https://api.dexscreener.com/token-boosts/latest/v1"
-DEX_TOKEN     = "https://api.dexscreener.com/latest/dex/tokens/"
-PUMP_COINS    = "https://frontend-api.pump.fun/coins?limit=50&sort=created_timestamp&order=DESC"
-PUMP_TOKEN    = "https://frontend-api.pump.fun/coins/"
-SOLSCAN_TOKEN = "https://public-api.solscan.io/token/holders?tokenAddress="
-SOLSCAN_META  = "https://public-api.solscan.io/token/meta?tokenAddress="
-SOL_RPC       = "https://api.mainnet-beta.solana.com"
+PUMP_WS    = "wss://pumpportal.fun/api/data"
+HELIUS_WS  = f"wss://mainnet.helius-rpc.com/?api-key={HELIUS_API_KEY}"
 
-# ── filters ───────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# REST ENDPOINTS  (enrichment only — not used for discovery)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-F_MC_MIN        = 5_000
-F_MC_MAX        = 50_000
-F_LP_MIN        = 4_000
-F_LP_MC_RATIO   = 0.08          # LP must be >= 8% of MC — no dumb coins
-F_TOP10_MAX     = 35            # %
-F_DEV_MAX       = 1             # %
-F_VOL_MIN       = 6_000
-F_HOLDERS_MIN   = 20
-F_REQUIRE_SOC   = True
-F_MAX_AGE_SECS  = 5 * 3600     # 5 hours — don't call old/dead coins
-F_DUMP_THRESH   = -80           # % — if 24h price change is worse than this, skip (already dumped)
+PUMP_REST      = "https://frontend-api.pump.fun/coins/"
+DEX_TOKEN      = "https://api.dexscreener.com/latest/dex/tokens/"
+SOLSCAN_HOLD   = "https://public-api.solscan.io/token/holders?tokenAddress="
+SOLSCAN_META   = "https://public-api.solscan.io/token/meta?tokenAddress="
+RUGCHECK_BASE  = "https://api.rugcheck.xyz/v1"
+SOL_PRICE_URL  = "https://price.jup.ag/v4/price?ids=SOL"
 
-# ── milestones — only re-alert at 2x and above ───────────────────────────────
+# Raydium v4 AMM program — subscribing to its logs catches pool creation = migration
+RAYDIUM_AMM    = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
 
-PUMP_MILESTONES = [2, 5, 10, 25, 50, 100]
+# ═══════════════════════════════════════════════════════════════════════════════
+# FILTER THRESHOLDS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# ── conversation state ────────────────────────────────────────────────────────
+F_MC_MIN         = 5_000       # USD
+F_MC_MAX         = 50_000      # USD
+F_SOL_IN_MIN     = 8           # SOL in bonding curve
+F_HOLDERS_MIN    = 40
+F_BUYS_PM_MIN    = 25          # buys per minute (2-min window)
+F_TOP_HOLDER_MAX = 20          # % single wallet max
+F_DEV_SOLD_MAX   = 1           # % dev may still hold
+F_MAX_AGE_SECS   = 5 * 3600   # 5 h
+F_REQUIRE_SOC    = True
+F_MIG_PROB_MIN   = 60          # % heuristic
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# MILESTONES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+MILESTONES = [2, 5, 10, 25, 50, 100]
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SHARED STATE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class TokenState:
+    mint          : str
+    name          : str    = "Unknown"
+    symbol        : str    = "?"
+    created_ts    : float  = 0.0
+    dev_wallet    : str    = ""
+    # live bonding curve stats
+    sol_in        : float  = 0.0        # SOL entered bonding curve
+    market_cap    : float  = 0.0        # USD
+    holders       : int    = 0
+    top_holder    : float  = 0.0        # % of supply
+    top5          : list   = field(default_factory=list)
+    dev_holding   : float  = 0.0        # % dev still holds
+    bonding_pct   : float  = 0.0        # % bonding curve filled
+    buy_times     : deque  = field(default_factory=lambda: deque(maxlen=300))
+    # socials
+    twitter       : str    = ""
+    telegram      : str    = ""
+    website       : str    = ""
+    # security
+    mint_revoked  : bool   = False
+    freeze_revoked: bool   = False
+    bundled       : bool   = False
+    rugcheck_label: str    = "unknown"
+    rugcheck_risks: list   = field(default_factory=list)
+    # migration
+    migrated      : bool   = False
+    raydium_pool  : str    = ""
+    lp_usd        : float  = 0.0
+    # call tracking
+    called        : bool   = False
+    called_mc     : float  = 0.0
+    called_ts     : float  = 0.0
+    next_milestone: Optional[int] = 2
+
+tokens       : dict[str, TokenState] = {}
+call_history : deque                 = deque(maxlen=500)
+bot_start    : float                 = time.time()
+sol_price    : float                 = 150.0
+
+http      = httpx.AsyncClient(timeout=12)
+flask_app = Flask(__name__)
 WAIT_PHOTO = 1
 
-# ── shared state ──────────────────────────────────────────────────────────────
-
-http           = httpx.AsyncClient(timeout=15)
-seen_tokens    : dict  = {}
-call_history   : deque = deque(maxlen=500)
-pnl_pending    : dict  = {}
-bot_start_time : float = time.time()
-flask_app              = Flask(__name__)
-
-# ════════════════════════════════════════════════════════════════════════════
-# FLASK
-# ════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# FLASK HEALTH CHECK
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @flask_app.route("/")
 def health():
-    return {"status": "alive", "calls": len(call_history)}
+    return {"status": "alive", "tracked": len(tokens), "calls": len(call_history)}
 
 def run_flask():
     flask_app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
 
-# ════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # HELPERS
-# ════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def fmt(n, decimals: int = 2) -> str:
-    if n is None:
-        return "?"
-    n = float(n)
-    if n >= 1_000_000_000:
-        return f"{n/1_000_000_000:.{decimals}f}B"
-    if n >= 1_000_000:
-        return f"{n/1_000_000:.{decimals}f}M"
-    if n >= 1_000:
-        return f"{n/1_000:.{decimals}f}K"
-    return f"{n:.{decimals}f}"
-
-def age_str(created_ts_ms) -> str:
-    if not created_ts_ms:
-        return "?"
-    secs = time.time() - float(created_ts_ms) / 1000
-    if secs < 60:    return f"{int(secs)}s"
-    if secs < 3600:  return f"{int(secs/60)}m"
-    if secs < 86400: return f"{secs/3600:.1f}h"
-    return f"{secs/86400:.1f}d"
-
-def age_secs(created_ts_ms) -> float:
-    """Return age in seconds from a ms timestamp."""
-    if not created_ts_ms:
-        return 999999
-    return time.time() - float(created_ts_ms) / 1000
-
-def since_str(ts: float) -> str:
-    return age_str(ts * 1000)
-
-async def fetch(url: str, json_body: dict = None):
-    try:
-        if json_body:
-            r = await http.post(url, json=json_body)
-        else:
-            r = await http.get(url)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.debug(f"fetch failed {url}: {e}")
-        return None
-
-def clean_addr(addr: str) -> str:
-    """
-    Strip any trailing 'pump' suffix that pump.fun appends to addresses
-    in some API responses (e.g. 'ABC...XYZpump' → 'ABC...XYZ').
-    Also strips whitespace and null bytes.
-    Solana addresses are base58, 32–44 chars, no lowercase L or 0 or O or I.
-    """
+def clean(addr: str) -> str:
+    """Strip pump.fun 'pump' suffix + whitespace from any address."""
     if not addr:
         return addr
     addr = addr.strip()
-    # pump.fun appends the literal word 'pump' to mint addresses in some endpoints
     if addr.endswith("pump"):
         addr = addr[:-4]
     return addr
 
-# ════════════════════════════════════════════════════════════════════════════
-# DATA FETCHING
-# ════════════════════════════════════════════════════════════════════════════
+def fmt(n, d: int = 2) -> str:
+    if n is None: return "?"
+    n = float(n)
+    if n >= 1_000_000_000: return f"{n/1e9:.{d}f}B"
+    if n >= 1_000_000:     return f"{n/1e6:.{d}f}M"
+    if n >= 1_000:         return f"{n/1e3:.{d}f}K"
+    return f"{n:.{d}f}"
 
-async def get_pump_data(address: str):
-    """
-    Pump.fun gives us LP (real_sol_reserves) BEFORE migration,
-    which DexScreener doesn't see yet. This is our primary LP source
-    for pre-migration tokens. We also read virtual_sol_reserves as fallback.
-    """
-    data = await fetch(PUMP_TOKEN + address)
-    if not data:
+def age_str(ts_secs: float) -> str:
+    s = time.time() - ts_secs
+    if s < 60:    return f"{int(s)}s"
+    if s < 3600:  return f"{int(s/60)}m"
+    if s < 86400: return f"{s/3600:.1f}h"
+    return f"{s/86400:.1f}d"
+
+def buys_per_minute(s: TokenState) -> float:
+    cutoff = time.time() - 120
+    return sum(1 for t in s.buy_times if t >= cutoff) / 2.0
+
+def migration_probability(s: TokenState) -> int:
+    score  = min(s.bonding_pct, 50)
+    score += min(buys_per_minute(s) * 0.5, 20)
+    if s.holders >= 100: score += 15
+    elif s.holders >= 40: score += 8
+    if s.sol_in >= 20: score += 15
+    elif s.sol_in >= 8: score += 8
+    return min(int(score), 100)
+
+async def fetch(url: str, json_body: dict = None):
+    try:
+        r = await http.post(url, json=json_body) if json_body else await http.get(url)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.debug(f"fetch error {url}: {e}")
         return None
 
-    # real_sol_reserves is actual SOL in bonding curve (in lamports)
-    real_sol_lamports    = float(data.get("real_sol_reserves") or 0)
-    real_sol             = real_sol_lamports / 1e9
+# ═══════════════════════════════════════════════════════════════════════════════
+# SOL PRICE — refreshed every 60 s
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    # virtual_sol_reserves is the virtual/simulated pool (also in lamports)
-    virtual_sol_lamports = float(data.get("virtual_sol_reserves") or 0)
-    virtual_sol          = virtual_sol_lamports / 1e9
+async def refresh_sol_price():
+    global sol_price
+    while True:
+        try:
+            data = await fetch(SOL_PRICE_URL)
+            p = float((data or {}).get("data", {}).get("SOL", {}).get("price") or 0)
+            if p > 0:
+                sol_price = p
+        except Exception:
+            pass
+        await asyncio.sleep(60)
 
-    # Prefer real SOL reserves; fall back to virtual
-    lp_sol = real_sol if real_sol > 0 else virtual_sol
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENRICHMENT SOURCES
+# ═══════════════════════════════════════════════════════════════════════════════
 
+async def enrich_from_pump(mint: str) -> dict:
+    data = await fetch(PUMP_REST + mint)
+    if not data:
+        return {}
+    real_sol = float(data.get("real_sol_reserves") or 0) / 1e9
+    virt_sol = float(data.get("virtual_sol_reserves") or 0) / 1e9
     return {
-        "migration"      : data.get("raydium_pool") is not None,
-        "bonding_curve"  : float(data.get("bonding_curve_percentage") or 0),
-        "dev_holding"    : float(data.get("creator_percentage") or 0),
-        "total_supply"   : float(data.get("total_supply") or 0),
-        "twitter"        : data.get("twitter", "") or "",
-        "telegram"       : data.get("telegram", "") or "",
-        "website"        : data.get("website", "") or "",
-        "lp_sol"         : lp_sol,           # SOL in bonding curve (pre-migration source of truth)
-        "real_sol"       : real_sol,         # actual SOL deposited
-        "virtual_sol"    : virtual_sol,      # virtual pool amount
-        "created_ts"     : data.get("created_timestamp"),   # ms timestamp
-        "king_of_hill"   : data.get("is_currently_live", False),
-        "market_cap_usd" : float(data.get("usd_market_cap") or 0),
+        "name"        : data.get("name", "Unknown"),
+        "symbol"      : data.get("symbol", "?"),
+        "dev_wallet"  : data.get("creator", ""),
+        "dev_holding" : float(data.get("creator_percentage") or 0),
+        "bonding_pct" : float(data.get("bonding_curve_percentage") or 0),
+        "sol_in"      : real_sol if real_sol > 0 else virt_sol,
+        "market_cap"  : float(data.get("usd_market_cap") or 0),
+        "migrated"    : data.get("raydium_pool") is not None,
+        "raydium_pool": data.get("raydium_pool") or "",
+        "twitter"     : data.get("twitter") or "",
+        "telegram"    : data.get("telegram") or "",
+        "website"     : data.get("website") or "",
+        "created_ts"  : float(data.get("created_timestamp") or 0) / 1000,
     }
 
-async def get_sol_price() -> float:
-    """Fetch SOL price in USD from Jupiter price API."""
-    try:
-        data = await fetch("https://price.jup.ag/v4/price?ids=SOL")
-        price = float((data or {}).get("data", {}).get("SOL", {}).get("price") or 0)
-        if price > 0:
-            return price
-    except Exception:
-        pass
-    # Fallback: try another source
-    try:
-        data = await fetch("https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd")
-        price = float(((data or {}).get("solana") or {}).get("usd") or 0)
-        if price > 0:
-            return price
-    except Exception:
-        pass
-    return 150.0  # last-resort fallback
-
-async def get_dex_data(address: str):
-    data = await fetch(DEX_TOKEN + address)
-    if not data:
-        return None
-    pairs = data.get("pairs") or []
-    if not pairs:
-        return None
-    p    = pairs[0]
-    base = p.get("baseToken", {})
-    info = p.get("info", {})
-    return {
-        "address"   : address,
-        "name"      : base.get("name", "Unknown"),
-        "symbol"    : base.get("symbol", "?"),
-        "price"     : float(p.get("priceUsd") or 0),
-        "mc"        : float(p.get("fdv") or 0),
-        "lp"        : float((p.get("liquidity") or {}).get("usd") or 0),
-        "vol_5m"    : float((p.get("volume") or {}).get("m5") or 0),
-        "vol_1h"    : float((p.get("volume") or {}).get("h1") or 0),
-        "vol_24h"   : float((p.get("volume") or {}).get("h24") or 0),
-        "buys_5m"   : int((p.get("txns") or {}).get("m5", {}).get("buys") or 0),
-        "sells_5m"  : int((p.get("txns") or {}).get("m5", {}).get("sells") or 0),
-        "buys_1h"   : int((p.get("txns") or {}).get("h1", {}).get("buys") or 0),
-        "sells_1h"  : int((p.get("txns") or {}).get("h1", {}).get("sells") or 0),
-        "chain"     : p.get("chainId", "solana"),
-        "dex"       : p.get("dexId", "?"),
-        "pair_age"  : age_str(p.get("pairCreatedAt")),
-        "pair_ts"   : p.get("pairCreatedAt"),   # ms
-        "url"       : p.get("url", ""),
-        "socials"   : info.get("socials", []),
-        "websites"  : info.get("websites", []),
-        "has_social": bool(info.get("socials") or info.get("websites")),
-        "dex_paid"  : bool(info.get("header") or info.get("openGraph")),
-        "price_1h"  : float((p.get("priceChange") or {}).get("h1") or 0),
-        "price_24h" : float((p.get("priceChange") or {}).get("h24") or 0),
-    }
-
-async def get_holders(address: str) -> dict:
-    result = {"top10_pct": None, "holder_count": None, "top_holders": []}
-    data = await fetch(f"{SOLSCAN_TOKEN}{address}&limit=10&offset=0")
+async def enrich_holders(mint: str) -> dict:
+    result = {"holders": 0, "top_holder": 0.0, "top5": []}
+    data   = await fetch(f"{SOLSCAN_HOLD}{mint}&limit=10&offset=0")
     if not data:
         return result
-    holders = data.get("data", [])
-    total   = data.get("total")
-    if not holders:
-        return result
-    supply_data = await fetch(f"{SOLSCAN_META}{address}")
-    supply = float((supply_data or {}).get("supply") or 0)
-    if supply:
-        top10_sum = sum(float(h.get("amount") or 0) for h in holders)
-        result["top10_pct"]   = round((top10_sum / supply) * 100, 1)
-        result["top_holders"] = [
-            round((float(h.get("amount") or 0) / supply) * 100, 2)
-            for h in holders[:5]
-        ]
-    result["holder_count"] = total
+    hlist  = data.get("data", [])
+    meta   = await fetch(f"{SOLSCAN_META}{mint}")
+    supply = float((meta or {}).get("supply") or 0)
+    if supply and hlist:
+        pcts = [round(float(h.get("amount") or 0) / supply * 100, 2) for h in hlist[:5]]
+        result["top_holder"] = pcts[0] if pcts else 0.0
+        result["top5"]       = pcts
+    result["holders"] = data.get("total") or 0
     return result
 
-async def get_fees_paid(address: str) -> float:
-    try:
-        payload = {
-            "jsonrpc": "2.0", "id": 1,
-            "method": "getSignaturesForAddress",
-            "params": [address, {"limit": 10}],
-        }
-        data = await fetch(SOL_RPC, json_body=payload)
-        if not data:
-            return 0.0
-        total = 0.0
-        for sig_info in (data.get("result") or [])[:5]:
-            sig = sig_info.get("signature")
-            tx  = await fetch(SOL_RPC, json_body={
-                "jsonrpc": "2.0", "id": 1,
-                "method": "getTransaction",
-                "params": [sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}],
-            })
-            if tx and tx.get("result"):
-                total += tx["result"].get("meta", {}).get("fee", 0) / 1e9
-        return round(total, 4)
-    except Exception as e:
-        logger.debug(f"get_fees_paid: {e}")
-        return 0.0
+async def enrich_rugcheck(mint: str) -> dict:
+    result = {
+        "mint_revoked"  : False,
+        "freeze_revoked": False,
+        "bundled"       : False,
+        "score_label"   : "unknown",
+        "risks"         : [],
+    }
+    data = await fetch(f"{RUGCHECK_BASE}/tokens/{mint}/report/summary")
+    if not data:
+        return result
+    score  = data.get("score") or 0
+    risks  = [r.get("name", "") for r in (data.get("risks") or [])]
+    result.update({
+        "mint_revoked"  : data.get("mintDisabled", False),
+        "freeze_revoked": data.get("freezeDisabled", False),
+        "bundled"       : any("bundle" in r.lower() for r in risks),
+        "risks"         : risks,
+        "score_label"   : ("✅ Good" if score < 300 else "⚠️ Risky" if score < 700 else "❌ Danger"),
+    })
+    return result
 
-# ════════════════════════════════════════════════════════════════════════════
-# RESOLVE LIQUIDITY
-# Priority: DexScreener LP (post-migration) → pump.fun real SOL reserves (pre-migration)
-# ════════════════════════════════════════════════════════════════════════════
+async def enrich_dex(mint: str) -> dict:
+    """Post-migration only — fetch Raydium LP from DexScreener."""
+    data = await fetch(DEX_TOKEN + mint)
+    if not data:
+        return {}
+    pairs = data.get("pairs") or []
+    if not pairs:
+        return {}
+    p = pairs[0]
+    return {
+        "lp_usd"   : float((p.get("liquidity") or {}).get("usd") or 0),
+        "mc_dex"   : float(p.get("fdv") or 0),
+        "dex_url"  : p.get("url", ""),
+    }
 
-async def resolve_lp_usd(dex: dict, pump, sol_price: float) -> float:
-    """
-    For pre-migration tokens DexScreener shows 0 LP because the pool
-    isn't on Raydium yet. We pull real_sol_reserves from pump.fun and
-    convert to USD so the LP filter works correctly from creation time.
-
-    Priority:
-      1. DexScreener LP USD (post-migration, most accurate)
-      2. pump.fun real_sol_reserves * sol_price (pre-migration)
-      3. pump.fun virtual_sol_reserves * sol_price (absolute fallback)
-    """
-    # Post-migration: DexScreener has the real pool LP
-    if dex and dex.get("lp", 0) > 0:
-        return dex["lp"]
-
+async def full_enrich(s: TokenState):
+    """Pull from all sources and update state in-place."""
+    pump = await enrich_from_pump(s.mint)
     if pump:
-        # Pre-migration: real SOL in bonding curve
-        if pump.get("real_sol", 0) > 0:
-            return pump["real_sol"] * sol_price
-        # Last resort: virtual SOL reserves
-        if pump.get("virtual_sol", 0) > 0:
-            return pump["virtual_sol"] * sol_price
+        s.name         = pump.get("name") or s.name
+        s.symbol       = pump.get("symbol") or s.symbol
+        s.dev_wallet   = pump.get("dev_wallet") or s.dev_wallet
+        s.dev_holding  = pump.get("dev_holding", s.dev_holding)
+        s.bonding_pct  = pump.get("bonding_pct", s.bonding_pct)
+        s.sol_in       = pump.get("sol_in") or s.sol_in
+        s.market_cap   = pump.get("market_cap") or s.market_cap
+        s.migrated     = pump.get("migrated", s.migrated)
+        s.raydium_pool = pump.get("raydium_pool") or s.raydium_pool
+        s.twitter      = pump.get("twitter") or s.twitter
+        s.telegram     = pump.get("telegram") or s.telegram
+        s.website      = pump.get("website") or s.website
+        if pump.get("created_ts", 0) > 0 and s.created_ts == 0:
+            s.created_ts = pump["created_ts"]
 
-    return 0.0
+    hold = await enrich_holders(s.mint)
+    s.holders    = hold.get("holders", s.holders)
+    s.top_holder = hold.get("top_holder", s.top_holder)
+    s.top5       = hold.get("top5", s.top5)
 
-# ════════════════════════════════════════════════════════════════════════════
-# SCORING
-# ════════════════════════════════════════════════════════════════════════════
+    rug = await enrich_rugcheck(s.mint)
+    s.mint_revoked    = rug.get("mint_revoked", s.mint_revoked)
+    s.freeze_revoked  = rug.get("freeze_revoked", s.freeze_revoked)
+    s.bundled         = rug.get("bundled", s.bundled)
+    s.rugcheck_label  = rug.get("score_label", s.rugcheck_label)
+    s.rugcheck_risks  = rug.get("risks", s.rugcheck_risks)
 
-def score_token(dex: dict, pump, holders: dict, lp_usd: float) -> tuple:
-    score = 0
-    notes = []
+    if s.migrated:
+        dex = await enrich_dex(s.mint)
+        if dex.get("lp_usd", 0) > 0:
+            s.lp_usd = dex["lp_usd"]
+        if dex.get("mc_dex", 0) > 0:
+            s.market_cap = dex["mc_dex"]
 
-    mc = dex["mc"] if dex["mc"] else (pump.get("market_cap_usd") if pump else 0)
+# ═══════════════════════════════════════════════════════════════════════════════
+# FILTER GATE
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    if F_MC_MIN <= mc <= F_MC_MAX:
-        score += 20
-        notes.append(f"✅ MC ${fmt(mc)} — in sweet spot ($5k–$50k)")
-    elif mc < F_MC_MIN:
-        notes.append(f"⚠️ MC ${fmt(mc)} — too low, higher risk of rug")
-    else:
-        notes.append(f"⚠️ MC ${fmt(mc)} — above $50k, early edge gone")
+def passes_filters(s: TokenState) -> tuple[bool, str]:
+    if s.created_ts > 0 and (time.time() - s.created_ts) > F_MAX_AGE_SECS:
+        return False, f"Too old — {age_str(s.created_ts)} (max 5h)"
 
-    if lp_usd >= F_LP_MIN:
-        score += 15
-        notes.append(f"✅ LP ${fmt(lp_usd)} — solid backing")
-    else:
-        notes.append(f"❌ LP ${fmt(lp_usd)} — thin, easy to manipulate")
+    if not (F_MC_MIN <= s.market_cap <= F_MC_MAX):
+        return False, f"MC ${fmt(s.market_cap)} outside $5k–$50k"
 
-    # LP/MC ratio — filter dumb coins where LP is way too small vs MC
-    if mc > 0 and lp_usd > 0:
-        lp_mc_ratio = lp_usd / mc
-        if lp_mc_ratio < F_LP_MC_RATIO:
-            notes.append(f"❌ LP/MC ratio {lp_mc_ratio:.2f} — LP way too small vs MC")
-        else:
-            score += 5
-            notes.append(f"✅ LP/MC ratio {lp_mc_ratio:.2f} — healthy")
+    # Liquidity: pre-migration = SOL in bonding curve; post = Raydium LP
+    lp_usd = s.lp_usd if s.migrated else s.sol_in * sol_price
+    if lp_usd < F_SOL_IN_MIN * sol_price:
+        return False, f"Low liquidity — {s.sol_in:.2f} SOL in curve (min {F_SOL_IN_MIN} SOL)"
 
-    b, s = dex["buys_5m"], dex["sells_5m"]
-    if b > s:
-        ratio = b / max(s, 1)
-        pts   = min(int(ratio * 4), 10)
-        score += pts
-        notes.append(f"✅ Buy pressure {b}B/{s}S — accumulation in play")
-    else:
-        notes.append(f"⚠️ Sell pressure {b}B/{s}S — distribution risk")
+    if s.holders < F_HOLDERS_MIN:
+        return False, f"Only {s.holders} holders (min {F_HOLDERS_MIN})"
 
-    if dex["vol_5m"] >= 1000:
-        score += 10
-        notes.append(f"✅ 5m vol ${fmt(dex['vol_5m'])} — active trading")
-    else:
-        notes.append(f"👀 Low 5m vol ${fmt(dex['vol_5m'])} — quiet, watch for breakout")
+    bpm = buys_per_minute(s)
+    if bpm < F_BUYS_PM_MIN:
+        return False, f"{bpm:.1f} buys/min (min {F_BUYS_PM_MIN})"
 
-    top10 = holders.get("top10_pct")
-    if top10 is not None:
-        if top10 <= F_TOP10_MAX:
-            score += 15
-            notes.append(f"✅ Top10 {top10}% — distributed supply")
-        elif top10 <= 50:
-            score += 5
-            notes.append(f"⚠️ Top10 {top10}% — somewhat concentrated")
-        else:
-            notes.append(f"❌ Top10 {top10}% — whale risk, concentrated")
+    if s.top_holder > F_TOP_HOLDER_MAX:
+        return False, f"Top holder {s.top_holder:.1f}% > {F_TOP_HOLDER_MAX}%"
 
-    hc = holders.get("holder_count")
-    if hc:
-        if hc >= 100:
-            score += 5
-            notes.append(f"✅ {hc} holders — good distribution")
-        elif hc >= F_HOLDERS_MIN:
-            score += 2
-            notes.append(f"👀 {hc} holders — early stage")
-        else:
-            notes.append(f"❌ Only {hc} holders — very early / risky")
+    if s.dev_holding > F_DEV_SOLD_MAX:
+        return False, f"Dev holding {s.dev_holding:.1f}% > {F_DEV_SOLD_MAX}%"
 
-    if pump and pump.get("migration"):
-        score += 10
-        notes.append("✅ Migrated from pump.fun — survived bonding curve")
-    elif pump:
-        bc = pump.get("bonding_curve", 0)
-        notes.append(f"👀 Still on pump.fun — {bc:.0f}% bonded")
+    if s.bundled:
+        return False, "Bundled wallets detected"
 
-    has_soc = dex["has_social"] or (pump and any([
-        pump.get("twitter"), pump.get("telegram"), pump.get("website")
-    ]))
-    if has_soc:
-        score += 5
-        notes.append("✅ Has socials — team is visible")
-    else:
-        notes.append("❌ No socials — anon dev, higher risk")
+    if F_REQUIRE_SOC and not any([s.twitter, s.telegram, s.website]):
+        return False, "No socials"
 
-    dev_h = pump.get("dev_holding", 999) if pump else 999
-    if dev_h <= F_DEV_MAX:
-        score += 10
-        notes.append(f"✅ Dev holding {dev_h:.1f}% — not a threat")
-    elif dev_h <= 5:
-        notes.append(f"⚠️ Dev holding {dev_h:.1f}% — monitor")
-    else:
-        notes.append(f"❌ Dev holding {dev_h:.1f}% — dump risk")
-
-    return min(score, 100), notes
-
-# ════════════════════════════════════════════════════════════════════════════
-# FILTER CHECK
-# ════════════════════════════════════════════════════════════════════════════
-
-def passes_filters(dex: dict, pump, holders: dict, fees: float, lp_usd: float) -> tuple:
-    mc    = dex["mc"] if dex["mc"] else (pump.get("market_cap_usd") if pump else 0)
-    top10 = holders.get("top10_pct")
-    hc    = holders.get("holder_count") or 0
-    dev_h = pump.get("dev_holding") if pump else None
-
-    # ── age filter: ignore coins older than 5 hours ───────────────────────────
-    pair_ts = dex.get("pair_ts")
-    pump_ts = pump.get("created_ts") if pump else None
-    ts_to_use = pair_ts or pump_ts
-    if ts_to_use and age_secs(ts_to_use) > F_MAX_AGE_SECS:
-        return False, f"Too old — created {age_str(ts_to_use)} ago (max 5h)"
-
-    # ── already dumped check — don't call dead coins ──────────────────────────
-    price_24h = dex.get("price_24h", 0)
-    if price_24h <= F_DUMP_THRESH:
-        return False, f"Already dumped — 24h price change {price_24h:.1f}% (threshold {F_DUMP_THRESH}%)"
-
-    if not (F_MC_MIN <= mc <= F_MC_MAX):
-        return False, f"MC ${fmt(mc)} out of $5k–$50k range"
-
-    # ── LP check: uses pump.fun real SOL for pre-migration tokens ─────────────
-    if lp_usd < F_LP_MIN:
-        return False, f"LP ${fmt(lp_usd)} below ${fmt(F_LP_MIN)}"
-
-    # ── LP/MC ratio: must be at least 8% — filter dumb/fake coins ────────────
-    if mc > 0 and lp_usd / mc < F_LP_MC_RATIO:
-        return False, f"LP/MC ratio {lp_usd/mc:.2f} — LP too small vs MC (dumb coin)"
-
-    if top10 is not None and top10 > F_TOP10_MAX:
-        return False, f"Top10 {top10}% exceeds {F_TOP10_MAX}%"
-    if hc < F_HOLDERS_MIN:
-        return False, f"Only {hc} holders (min {F_HOLDERS_MIN})"
-    if dev_h is not None and dev_h > F_DEV_MAX:
-        return False, f"Dev holding {dev_h:.1f}% > {F_DEV_MAX}%"
-    if dex["vol_24h"] < F_VOL_MIN:
-        return False, f"24h vol ${fmt(dex['vol_24h'])} below ${fmt(F_VOL_MIN)}"
-
-    if F_REQUIRE_SOC:
-        has_soc = dex["has_social"] or (pump and any([
-            pump.get("twitter"), pump.get("telegram"), pump.get("website")
-        ]))
-        if not has_soc:
-            return False, "No socials found"
-
-    # ── wash trading detection ────────────────────────────────────────────────
-    vol_1h = dex["vol_1h"]
-    if mc and vol_1h and vol_1h > mc * 3:
-        return False, f"Suspicious vol — 1h vol ${fmt(vol_1h)} is {vol_1h/mc:.1f}x MC (wash trading)"
-
-    buys  = dex["buys_5m"]
-    sells = dex["sells_5m"]
-    if buys + sells > 0:
-        ratio = buys / max(sells, 1)
-        if ratio < 0.3:
-            return False, f"B/S ratio {ratio:.2f} — heavy sell pressure"
-        if ratio > 5.0:
-            return False, f"B/S ratio {ratio:.2f} — suspiciously one-sided (bot buying)"
+    mp = migration_probability(s)
+    if mp < F_MIG_PROB_MIN:
+        return False, f"Migration probability {mp}% < {F_MIG_PROB_MIN}%"
 
     return True, "ok"
 
-# ════════════════════════════════════════════════════════════════════════════
-# ALERT FORMAT
-# ════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# ALERT BUILDER
+# ═══════════════════════════════════════════════════════════════════════════════
 
-def build_alert(dex: dict, pump, holders: dict, fees: float, score: int,
-                lp_usd: float, tag: str = "🔥 HIGH SCORE CALL") -> str:
-    addr     = dex["address"]
-    top10    = holders.get("top10_pct", "?")
-    top_h    = holders.get("top_holders", [])
-    hcount   = holders.get("holder_count", "?")
-    dev_h    = f"{pump.get('dev_holding', '?'):.1f}" if pump and pump.get("dev_holding") is not None else "?"
-    migrated = pump.get("migration", False) if pump else False
-    bc       = pump.get("bonding_curve", 0) if pump else 0
-    twitter  = (pump.get("twitter") if pump else "") or ""
-    tg       = (pump.get("telegram") if pump else "") or ""
-    web      = (pump.get("website") if pump else "") or ""
+def build_alert(s: TokenState, tag: str = "🔥 GEM FOUND") -> str:
+    bpm    = buys_per_minute(s)
+    mp     = migration_probability(s)
+    lp_str = (f"${fmt(s.lp_usd)} (Raydium)" if s.migrated
+              else f"{s.sol_in:.2f} SOL in bonding curve")
 
-    soc_parts = []
-    if twitter: soc_parts.append(f"[X]({twitter})")
-    for s in dex.get("socials", []):
-        label = s.get("type", "link").capitalize()
-        url   = s.get("url", "")
-        if url: soc_parts.append(f"[{label}]({url})")
-    for w in dex.get("websites", []):
-        url = w.get("url", "")
-        if url: soc_parts.append(f"[Web]({url})")
-    if tg:  soc_parts.append(f"[TG]({tg})")
-    if web and not soc_parts: soc_parts.append(f"[Web]({web})")
-    soc_line = " · ".join(soc_parts) if soc_parts else "None"
+    soc = []
+    if s.twitter:  soc.append(f"[X]({s.twitter})")
+    if s.telegram: soc.append(f"[TG]({s.telegram})")
+    if s.website:  soc.append(f"[Web]({s.website})")
+    soc_line = " · ".join(soc) if soc else "None"
 
-    th_line  = "|".join(str(x) for x in top_h) if top_h else "?"
-    s_emoji  = "🔥" if score >= 80 else "⚡" if score >= 60 else "👀"
-    mc_val   = dex["mc"] if dex["mc"] else (pump.get("market_cap_usd") if pump else 0)
+    top5_str = " | ".join(f"{p}%" for p in s.top5) if s.top5 else "?"
 
-    # LP source label so we know where the LP came from
-    if dex.get("lp", 0) > 0:
-        lp_source = "DEX"
-    elif pump and pump.get("real_sol", 0) > 0:
-        lp_source = "pump.fun (real SOL)"
-    elif pump and pump.get("virtual_sol", 0) > 0:
-        lp_source = "pump.fun (virtual)"
-    else:
-        lp_source = "unknown"
+    ca      = s.mint
+    photon  = f"https://photon-sol.tinyastro.io/en/r/@{ca}"
+    bullx   = f"https://bullx.io/terminal?chainId=1399811149&address={ca}"
+    trojan  = f"https://t.me/solana_trojanbot?start={ca}"
+    dex_url = f"https://dexscreener.com/solana/{ca}"
+
+    emoji = "🔥" if mp >= 80 else "⚡" if mp >= 60 else "👀"
 
     return (
-        f"{s_emoji} *{tag}*\n"
-        f"Token: *{dex['name']}* (${dex['symbol']})\n"
-        f"CA: `{addr}`\n"
-        f"└ #{dex['chain'].upper()} | ⏱ {dex['pair_age']} | 🔗 [Chart]({dex['url']})\n"
+        f"{emoji} *{tag}*\n"
+        f"Token: *{s.name}* (${s.symbol})\n"
+        f"CA: `{ca}`\n"
+        f"Age: {age_str(s.created_ts)}\n"
         f"\n"
-        f"📊 *Stats*\n"
-        f"├ USD    `${dex['price']:.8f}` ({dex['price_1h']:+.1f}% 1h)\n"
-        f"├ MC     `${fmt(mc_val)}`\n"
-        f"├ Vol    `${fmt(dex['vol_24h'])}` · 5m: `${fmt(dex['vol_5m'])}`\n"
-        f"├ LP     `${fmt(lp_usd)}` _{lp_source}_\n"
-        f"├ B/S    `{dex['buys_5m']}` / `{dex['sells_5m']}` (5m)\n"
-        f"├ Migration  {'✅ YES' if migrated else f'❌ NO ({bc:.0f}% bonded)'}\n"
-        f"├ Fees Paid  `{fees:.4f} SOL`\n"
+        f"📊 *Bonding Curve*\n"
+        f"├ MC           `${fmt(s.market_cap)}`\n"
+        f"├ Liquidity    `{lp_str}`\n"
+        f"├ Bonding      `{s.bonding_pct:.1f}%` filled\n"
+        f"├ Buys/min     `{bpm:.1f}`\n"
+        f"├ Holders      `{s.holders}`\n"
+        f"├ Mig. Prob.   `{mp}%`\n"
+        f"└ Migration    {'✅ YES — on Raydium' if s.migrated else '⏳ NOT YET'}\n"
         f"\n"
         f"🔒 *Security*\n"
-        f"├ Top 10   `{top10}%` | `{hcount}` total holders\n"
-        f"├ TH       `{th_line}`\n"
-        f"├ Dev Sold  `{dev_h}%` holding\n"
-        f"└ DEX Paid  {'✅' if dex['dex_paid'] else '❌'}\n"
+        f"├ RugCheck     `{s.rugcheck_label}`\n"
+        f"├ Top holder   `{s.top_holder:.1f}%`\n"
+        f"├ Top 5        `{top5_str}`\n"
+        f"├ Dev holding  `{s.dev_holding:.1f}%`\n"
+        f"├ Mint revoked `{'✅' if s.mint_revoked else '❌'}`\n"
+        f"├ Freeze rev.  `{'✅' if s.freeze_revoked else '❌'}`\n"
+        f"└ Bundled      `{'❌ YES — avoid' if s.bundled else '✅ Clean'}`\n"
         f"\n"
         f"🔗 *Socials*\n"
         f"└ {soc_line}\n"
         f"\n"
-        f"{s_emoji} Score: *{score}/100*"
+        f"⚡ *Trade*\n"
+        f"[Photon]({photon}) · [BullX]({bullx}) · [Trojan]({trojan}) · [DEX]({dex_url})\n"
+        f"\n"
+        f"{emoji} Mig. Probability: *{mp}%*"
     )
 
-# ════════════════════════════════════════════════════════════════════════════
-# FULL ANALYSE
-# ════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# ALERT SENDER + CALL RECORDER
+# ═══════════════════════════════════════════════════════════════════════════════
 
-async def analyse(address: str):
-    dex = await get_dex_data(address)
-    if not dex:
-        return None, None, {}, 0.0, 0, [], 0.0
-    pump      = await get_pump_data(address)
-    holders   = await get_holders(address)
-    fees      = await get_fees_paid(address)
-    sol_price = await get_sol_price()
-    lp_usd    = await resolve_lp_usd(dex, pump, sol_price)
-    score, notes = score_token(dex, pump, holders, lp_usd)
-    return dex, pump, holders, fees, score, notes, lp_usd
+async def send_alert(app, s: TokenState, tag: str = "🔥 GEM FOUND"):
+    if not CHAT_ID:
+        return
+    try:
+        await app.bot.send_message(
+            chat_id=CHAT_ID, text=build_alert(s, tag),
+            parse_mode="Markdown", disable_web_page_preview=True,
+        )
+    except Exception as e:
+        log.error(f"send_alert: {e}")
 
-# ════════════════════════════════════════════════════════════════════════════
+def record_call(s: TokenState):
+    call_history.appendleft({
+        "mint": s.mint, "name": s.name, "symbol": s.symbol,
+        "mc": s.market_cap, "ts": time.time(),
+    })
+    s.called = True
+    s.called_mc = s.market_cap
+    s.called_ts = time.time()
+    s.next_milestone = 2
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENRICH + FILTER + ALERT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def enrich_and_maybe_alert(app, mint: str, force: bool = False):
+    s = tokens.get(mint)
+    if not s or (s.called and not force):
+        return
+
+    await full_enrich(s)
+
+    if s.created_ts > 0 and (time.time() - s.created_ts) > F_MAX_AGE_SECS:
+        return
+
+    passed, reason = passes_filters(s)
+    if not passed:
+        log.debug(f"Filtered {s.name} ({mint}): {reason}")
+        return
+
+    log.info(f"✅ CALLING {s.name} (${s.symbol}) MC=${fmt(s.market_cap)} bpm={buys_per_minute(s):.1f}")
+    record_call(s)
+    tag = "🚀 MIGRATED GEM" if s.migrated else "🔥 PRE-MIGRATION GEM"
+    await send_alert(app, s, tag)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PUMP.FUN WEBSOCKET
+# Docs: https://pumpportal.fun/
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def pump_ws_loop(app):
+    backoff = 2
+    while True:
+        try:
+            log.info("Connecting to pump.fun WebSocket…")
+            async with websockets.connect(
+                PUMP_WS, ping_interval=20, ping_timeout=30, close_timeout=10,
+            ) as ws:
+                backoff = 2
+                # Subscribe to new token mints AND all trades
+                await ws.send(json.dumps({"method": "subscribeNewToken"}))
+                await ws.send(json.dumps({"method": "subscribeTokenTrade"}))
+                log.info("pump.fun WS connected and subscribed ✓")
+                async for raw in ws:
+                    try:
+                        await handle_pump_event(app, json.loads(raw))
+                    except Exception as e:
+                        log.debug(f"pump WS event error: {e}")
+        except Exception as e:
+            log.warning(f"pump.fun WS dropped: {e} — retry in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+async def handle_pump_event(app, msg: dict):
+    txtype = msg.get("txType") or msg.get("type") or ""
+    mint   = clean(msg.get("mint") or msg.get("tokenAddress") or "")
+    if not mint:
+        return
+
+    now = time.time()
+
+    # ── New token minted ──────────────────────────────────────────────────────
+    if txtype in ("create", "newCoin"):
+        if mint in tokens:
+            return
+        s = TokenState(
+            mint       = mint,
+            created_ts = now,
+            name       = msg.get("name", "Unknown"),
+            symbol     = msg.get("symbol", "?"),
+            dev_wallet = msg.get("creator", ""),
+            sol_in     = float(msg.get("solAmount", 0)) / 1e9,
+            market_cap = float(msg.get("marketCapSol", 0)) * sol_price,
+        )
+        tokens[mint] = s
+        log.info(f"New token: {s.name} ({s.symbol}) {mint}")
+        asyncio.create_task(enrich_and_maybe_alert(app, mint))
+        return
+
+    # ── Buy / Sell trade ──────────────────────────────────────────────────────
+    if txtype in ("buy", "sell"):
+        if mint not in tokens:
+            s = TokenState(mint=mint, created_ts=now)
+            tokens[mint] = s
+            asyncio.create_task(enrich_and_maybe_alert(app, mint))
+
+        s = tokens[mint]
+        sol_amount = float(msg.get("solAmount", 0)) / 1e9
+        new_mc     = float(msg.get("marketCapSol", 0)) * sol_price
+
+        if txtype == "buy":
+            s.sol_in += sol_amount
+            s.buy_times.append(now)
+
+        if new_mc > 0:
+            s.market_cap = new_mc
+
+        # Check milestones live from WS events (no REST call needed)
+        if s.called and s.called_mc > 0:
+            asyncio.create_task(check_milestone(app, mint))
+
+        # Re-evaluate filter every 10 buys before first alert
+        if not s.called and txtype == "buy" and len(s.buy_times) % 10 == 0:
+            asyncio.create_task(enrich_and_maybe_alert(app, mint))
+        return
+
+    # ── Migration ─────────────────────────────────────────────────────────────
+    if txtype in ("migrate", "migration") or msg.get("raydiumPool"):
+        if mint not in tokens:
+            tokens[mint] = TokenState(mint=mint, created_ts=now)
+        s = tokens[mint]
+        s.migrated     = True
+        s.raydium_pool = msg.get("raydiumPool", "")
+        log.info(f"Migration: {s.name} ({mint})")
+        asyncio.create_task(enrich_and_maybe_alert(app, mint, force=True))
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HELIUS WEBSOCKET — Raydium AMM log subscription
+# Catches migration events even if pump.fun WS misses them
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def helius_ws_loop(app):
+    if not HELIUS_API_KEY:
+        log.warning("No HELIUS_API_KEY set — Helius WS disabled. Migration detection via pump.fun WS only.")
+        return
+
+    backoff = 2
+    while True:
+        try:
+            log.info("Connecting to Helius WebSocket…")
+            async with websockets.connect(
+                HELIUS_WS, ping_interval=20, ping_timeout=30,
+            ) as ws:
+                backoff = 2
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0", "id": 1,
+                    "method": "logsSubscribe",
+                    "params": [
+                        {"mentions": [RAYDIUM_AMM]},
+                        {"commitment": "confirmed"},
+                    ],
+                }))
+                log.info("Helius WS subscribed to Raydium AMM logs ✓")
+                async for raw in ws:
+                    try:
+                        await handle_helius_event(app, json.loads(raw))
+                    except Exception as e:
+                        log.debug(f"Helius event error: {e}")
+        except Exception as e:
+            log.warning(f"Helius WS dropped: {e} — retry in {backoff}s")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+async def handle_helius_event(app, msg: dict):
+    result = msg.get("params", {}).get("result", {})
+    if not result:
+        return
+    value  = result.get("value", {})
+    if value.get("err"):
+        return
+    logs   = value.get("logs", [])
+    # Only care about new pool initialization (migration = new Raydium pool)
+    if not any("initialize" in l.lower() for l in logs):
+        return
+    log_str = " ".join(logs)
+    for mint in list(tokens.keys()):
+        if mint in log_str and not tokens[mint].migrated:
+            log.info(f"Helius: migration detected for {tokens[mint].name} ({mint})")
+            tokens[mint].migrated = True
+            asyncio.create_task(enrich_and_maybe_alert(app, mint, force=True))
+            break
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MILESTONE TRACKER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def check_milestone(app, mint: str):
+    s = tokens.get(mint)
+    if not s or not s.called or not s.called_mc or not s.next_milestone:
+        return
+    if time.time() - s.called_ts > 172800:
+        s.next_milestone = None
+        return
+    mult = s.market_cap / s.called_mc
+    ms   = s.next_milestone
+    if mult >= ms:
+        s.next_milestone = next((m for m in MILESTONES if m > ms), None)
+        if CHAT_ID:
+            try:
+                await app.bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=(
+                        f"🚀 *{ms}x MILESTONE — {s.name}*\n"
+                        f"Called at `${fmt(s.called_mc)}` MC\n"
+                        f"Now: `${fmt(s.market_cap)}` MC\n"
+                        f"📈 *{mult:.1f}x* from call\n"
+                        f"CA: `{mint}`"
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                log.error(f"milestone send: {e}")
+
+async def milestone_poll_loop(app):
+    """Polls pump.fun every 30 s for all called tokens to catch milestones."""
+    while True:
+        await asyncio.sleep(30)
+        for mint, s in list(tokens.items()):
+            if not s.called or not s.next_milestone:
+                continue
+            try:
+                pump = await enrich_from_pump(mint)
+                mc   = pump.get("market_cap", 0)
+                if mc > 0:
+                    s.market_cap = mc
+                await check_milestone(app, mint)
+            except Exception as e:
+                log.debug(f"milestone poll {mint}: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLEANUP
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def cleanup_loop():
+    while True:
+        await asyncio.sleep(3600)
+        cutoff = time.time() - 172800
+        stale  = [m for m, s in tokens.items() if s.created_ts > 0 and s.created_ts < cutoff and not s.next_milestone]
+        for m in stale:
+            tokens.pop(m, None)
+        if stale:
+            log.info(f"Cleaned {len(stale)} stale tokens")
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # PNL CARD
-# ════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def make_pnl_card(bg_bytes: bytes, name: str, symbol: str,
                   called_mc: float, current_mc: float, called_at_ts: float) -> io.BytesIO:
     bg = Image.open(io.BytesIO(bg_bytes)).convert("RGBA")
     bg = bg.resize((800, 450), Image.LANCZOS)
-
     overlay = Image.new("RGBA", bg.size, (0, 0, 0, 160))
     bg      = Image.alpha_composite(bg, overlay)
     draw    = ImageDraw.Draw(bg)
 
-    mult     = (current_mc / called_mc) if called_mc and called_mc > 0 else 1.0
-    mult_str = f"{mult:.1f}x"
-    elapsed  = time.time() - called_at_ts
-    d        = int(elapsed // 86400)
-    h        = int((elapsed % 86400) // 3600)
+    mult      = (current_mc / called_mc) if called_mc and called_mc > 0 else 1.0
+    d, h      = divmod(int(time.time() - called_at_ts), 86400)
+    h         = h // 3600
     since_val = f"{d}d, {h}h" if d else f"{h}h"
 
-    # try system fonts, fall back gracefully
-    font_big  = ImageFont.load_default()
-    font_mid  = ImageFont.load_default()
-    font_sm   = ImageFont.load_default()
-    font_name = ImageFont.load_default()
-    for font_path in [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-    ]:
-        if os.path.exists(font_path):
+    font_big = font_mid = font_sm = font_name = ImageFont.load_default()
+    for fp in ["/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+               "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+               "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"]:
+        if os.path.exists(fp):
             try:
-                font_big  = ImageFont.truetype(font_path, 90)
-                font_mid  = ImageFont.truetype(font_path, 38)
-                font_sm   = ImageFont.truetype(font_path, 24)
-                font_name = ImageFont.truetype(font_path, 52)
+                font_big  = ImageFont.truetype(fp, 90)
+                font_mid  = ImageFont.truetype(fp, 38)
+                font_sm   = ImageFont.truetype(fp, 24)
+                font_name = ImageFont.truetype(fp, 52)
             except Exception:
                 pass
             break
 
-    W, H   = bg.size
-    GREEN  = (0, 255, 100, 255)
-    RED    = (255, 80, 80, 255)
-    WHITE  = (255, 255, 255, 255)
-    GREY   = (180, 180, 180, 255)
-    YELLOW = (255, 220, 0, 255)
+    W, H = bg.size
+    draw.text((W-20, 30),        f"${symbol}",                     font=font_name, fill=(255,255,255,255), anchor="ra")
+    draw.text((W-20, 90),        name,                              font=font_sm,   fill=(180,180,180,255), anchor="ra")
+    draw.text((40, 30),          f"called at ${fmt(called_mc, 0)}", font=font_mid,  fill=(180,180,180,255))
+    draw.text((W//2, H//2-20),   f"{mult:.1f}x",                   font=font_big,
+              fill=((0,255,100,255) if mult >= 1 else (255,80,80,255)),             anchor="mm")
+    draw.text((W//2, H//2+65),   f"since call: {since_val}",       font=font_sm,   fill=(255,255,255,255), anchor="mm")
+    draw.text((40, H-50),        f"Called MC:  ${fmt(called_mc)}", font=font_sm,   fill=(180,180,180,255))
+    draw.text((40, H-25),        f"Current MC: ${fmt(current_mc)}",font=font_sm,   fill=(255,255,255,255))
+    draw.text((W-20, H-20),      "GemStalker",                      font=font_sm,   fill=(255,220,0,255),   anchor="ra")
 
-    mult_color = GREEN if mult >= 1.0 else RED
-
-    draw.text((W - 20, 30),           f"${symbol}",                      font=font_name, fill=WHITE,      anchor="ra")
-    draw.text((W - 20, 90),           name,                               font=font_sm,   fill=GREY,       anchor="ra")
-    draw.text((40, 30),               f"called at ${fmt(called_mc, 0)}",  font=font_mid,  fill=GREY)
-    draw.text((W // 2, H // 2 - 20), mult_str,                            font=font_big,  fill=mult_color, anchor="mm")
-    draw.text((W // 2, H // 2 + 65), f"since call: {since_val}",         font=font_sm,   fill=WHITE,      anchor="mm")
-    draw.text((40, H - 50),           f"Called MC:   ${fmt(called_mc)}", font=font_sm,   fill=GREY)
-    draw.text((40, H - 25),           f"Current MC: ${fmt(current_mc)}", font=font_sm,   fill=WHITE)
-    draw.text((W - 20, H - 20),       "GemStalker",                       font=font_sm,   fill=YELLOW,     anchor="ra")
-
-    out = bg.convert("RGB")
     buf = io.BytesIO()
-    out.save(buf, format="JPEG", quality=92)
+    bg.convert("RGB").save(buf, format="JPEG", quality=92)
     buf.seek(0)
     return buf
 
-# ════════════════════════════════════════════════════════════════════════════
-# COMMANDS
-# ════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM COMMANDS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🚀 *Alpha Scanner Bot*\n\n"
-        "📡 *Tracking:*\n"
-        "• New Pairs\n"
-        "• Pump.fun Migrations\n"
-        "• Smart Money Buys\n\n"
+        "🚀 *GemStalker — Pre-Migration Scanner*\n\n"
+        "📡 *Sources (real-time):*\n"
+        "• pump.fun WebSocket — bonding curve events\n"
+        "• Helius WebSocket — Raydium migration detection\n"
+        "• RugCheck API — security checks\n\n"
         "🔽 *Filters:*\n"
-        "• MCAP: $5k–$50k\n"
-        "• LP > $4k (reads pump.fun real SOL pre-migration)\n"
-        "• LP/MC ratio ≥ 8% (no dumb coins)\n"
-        "• Top 10 < 35%\n"
-        "• Dev Holding ≤ 1%\n"
-        "• Vol > $6k · Holders ≥ 20\n"
-        "• Age ≤ 5h · No already-dumped coins\n"
-        "• Requires Socials\n\n"
+        "• MC $5k–$50k\n"
+        "• Liquidity ≥ 8 SOL in bonding curve\n"
+        "• Holders ≥ 40\n"
+        "• Buys/min ≥ 25\n"
+        "• Top holder < 20%\n"
+        "• Dev holding ≤ 1%\n"
+        "• No bundled wallets\n"
+        "• Migration probability ≥ 60%\n"
+        "• Age ≤ 5h · Requires socials\n\n"
         "📋 *Commands:*\n"
-        "`/calls` — calls this month with X multiple\n"
-        "`/scan <CA>` — deep scan + insights\n"
+        "`/scan <CA>` — deep scan any token\n"
+        "`/calls` — this month's calls with X multiple\n"
         "`/pnl <CA>` — PNL card generator\n"
         "`/status` — bot stats",
         parse_mode="Markdown",
     )
 
-async def scan_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    args = context.args
-    if not args:
+async def cmd_scan(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args:
         await update.message.reply_text("Usage: `/scan <CA>`", parse_mode="Markdown")
         return
-    ca  = clean_addr(args[0].strip())
-    msg = await update.message.reply_text("🔍 Analysing…")
-    dex, pump, holders, fees, score, notes, lp_usd = await analyse(ca)
-    if not dex:
-        await msg.edit_text("❌ Token not found on DexScreener.")
+    mint = clean(ctx.args[0].strip())
+    msg  = await update.message.reply_text("🔍 Scanning…")
+
+    s = tokens.get(mint)
+    if not s:
+        s = TokenState(mint=mint)
+        tokens[mint] = s
+    await full_enrich(s)
+
+    if s.name == "Unknown" and s.market_cap == 0:
+        await msg.edit_text("❌ Token not found. Check the CA.")
         return
-    passed, reason = passes_filters(dex, pump, holders, fees, lp_usd)
-    alert   = build_alert(dex, pump, holders, fees, score, lp_usd,
-                          tag="✅ PASSES FILTERS" if passed else f"⚠️ FILTERED — {reason}")
-    insight = "\n".join(f"  {n}" for n in notes)
+
+    passed, reason = passes_filters(s)
+    tag    = "✅ PASSES FILTERS" if passed else f"⚠️ FILTERED — {reason}"
+    bpm    = buys_per_minute(s)
+    mp     = migration_probability(s)
+    extra  = (
+        f"\n\n💡 *Scan Details:*\n"
+        f"  Buys/min: `{bpm:.1f}`\n"
+        f"  Migration probability: `{mp}%`\n"
+        f"  SOL in curve: `{s.sol_in:.2f}`\n"
+        f"  Bonding filled: `{s.bonding_pct:.1f}%`\n"
+        f"  Mint revoked: `{'✅' if s.mint_revoked else '❌'}`\n"
+        f"  Freeze revoked: `{'✅' if s.freeze_revoked else '❌'}`\n"
+        f"  RugCheck risks: `{', '.join(s.rugcheck_risks) or 'none'}`"
+    )
     await msg.edit_text(
-        alert + f"\n\n💡 *Insights:*\n{insight}",
-        parse_mode="Markdown",
-        disable_web_page_preview=True,
+        build_alert(s, tag) + extra,
+        parse_mode="Markdown", disable_web_page_preview=True,
     )
 
-async def calls_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    /calls — show calls made this month with current X multiple.
-    Clean format: name, called MC → current MC, X multiple.
-    No timestamps shown.
-    """
+async def cmd_calls(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not call_history:
         await update.message.reply_text("No calls yet this session.")
         return
-
-    now       = time.time()
-    month_ago = now - 30 * 86400
+    month_ago  = time.time() - 30 * 86400
     this_month = [c for c in call_history if c["ts"] >= month_ago]
-
     if not this_month:
         await update.message.reply_text("No calls in the last 30 days.")
         return
 
     msg = await update.message.reply_text("📊 Fetching current prices…")
-    lines   = []
-    winners = 0
-
+    lines, winners = [], 0
     for i, c in enumerate(this_month, 1):
         try:
-            dex_now  = await get_dex_data(c["address"])
-            curr_mc  = dex_now["mc"] if dex_now and dex_now["mc"] else c["mc"]
+            pump    = await enrich_from_pump(c["mint"])
+            curr_mc = pump.get("market_cap") or c["mc"]
         except Exception:
-            curr_mc  = c["mc"]
-
-        called_mc = c["mc"]
-        mult      = (curr_mc / called_mc) if called_mc and called_mc > 0 else 1.0
-        mult_str  = f"{mult:.1f}x"
-
-        if mult >= 2:
-            winners += 1
-            emoji = "🚀"
-        elif mult >= 1.2:
-            emoji = "📈"
-        elif mult >= 0.8:
-            emoji = "😐"
-        else:
-            emoji = "📉"
-
+            curr_mc = c["mc"]
+        mult = curr_mc / c["mc"] if c["mc"] > 0 else 1.0
+        if mult >= 2: winners += 1
+        emoji = "🚀" if mult >= 2 else "📈" if mult >= 1.2 else "😐" if mult >= 0.8 else "📉"
         lines.append(
             f"{i}. {emoji} *{c['name']}* (${c['symbol']})\n"
-            f"   `${fmt(called_mc)}` → `${fmt(curr_mc)}` | *{mult_str}*"
+            f"   `${fmt(c['mc'])}` → `${fmt(curr_mc)}` | *{mult:.1f}x*"
         )
-
-    total = len(this_month)
     await msg.edit_text(
-        f"📣 *Calls this month* — {total} total | {winners} hit 2x+\n\n"
+        f"📣 *Calls this month* — {len(this_month)} total | {winners} hit 2x+\n\n"
         + "\n\n".join(lines),
         parse_mode="Markdown",
     )
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    uptime = str(datetime.timedelta(seconds=int(time.time() - bot_start_time)))
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uptime = str(datetime.timedelta(seconds=int(time.time() - bot_start)))
     await update.message.reply_text(
         f"✅ *GemStalker Status*\n"
-        f"⏱ Uptime: `{uptime}`\n"
-        f"👁 Seen: `{len(seen_tokens)}` tokens\n"
-        f"📣 Calls: `{len(call_history)}`\n"
-        f"🔴 Stream: live",
+        f"⏱ Uptime:     `{uptime}`\n"
+        f"👁 Tracking:   `{len(tokens)}` tokens\n"
+        f"📣 Calls:      `{len(call_history)}`\n"
+        f"💰 SOL price:  `${sol_price:.2f}`\n"
+        f"📡 Streams:    pump.fun WS + Helius WS",
         parse_mode="Markdown",
     )
 
-# ── /pnl conversation ─────────────────────────────────────────────────────────
+# ── /pnl conversation ──────────────────────────────────────────────────────────
 
-async def pnl_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    args = context.args
-    if not args:
+async def cmd_pnl(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    if not ctx.args:
         await update.message.reply_text("Usage: `/pnl <CA>`", parse_mode="Markdown")
         return ConversationHandler.END
 
-    ca  = clean_addr(args[0].strip())
-    uid = update.effective_user.id
-
-    # look up in call history first
-    record = next((c for c in call_history if c["address"] == ca), None)
+    mint   = clean(ctx.args[0].strip())
+    record = next((c for c in call_history if c["mint"] == mint), None)
 
     if not record:
-        wait_msg = await update.message.reply_text("🔍 Fetching token data…")
-        dex, _, _, _, score, _, lp_usd = await analyse(ca)
-        if wait_msg:
-            try:
-                await wait_msg.delete()
-            except Exception:
-                pass
-        if not dex:
-            await update.message.reply_text("❌ Token not found. Check the CA and try again.")
+        wait = await update.message.reply_text("🔍 Fetching token data…")
+        s    = tokens.get(mint) or TokenState(mint=mint)
+        await full_enrich(s)
+        try:
+            await wait.delete()
+        except Exception:
+            pass
+        if s.market_cap == 0:
+            await update.message.reply_text("❌ Token not found. Check the CA.")
             return ConversationHandler.END
-        record = {
-            "address": ca,
-            "name"   : dex["name"],
-            "symbol" : dex["symbol"],
-            "mc"     : dex["mc"],
-            "price"  : dex["price"],
-            "ts"     : time.time(),
-            "score"  : score,
-        }
+        record = {"mint": mint, "name": s.name, "symbol": s.symbol, "mc": s.market_cap, "ts": time.time()}
 
-    # Store pending data in context.user_data so it survives across handlers
-    context.user_data["pnl_record"] = record
-
+    ctx.user_data["pnl_record"] = record
     await update.message.reply_text(
-        f"📸 Send me the background image for your *{record['name']}* PNL card.\n"
-        f"Send /cancel to abort.",
+        f"📸 Send background image for your *{record['name']}* PNL card.\nSend /cancel to abort.",
         parse_mode="Markdown",
     )
     return WAIT_PHOTO
 
-async def pnl_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    record = context.user_data.get("pnl_record")
+async def pnl_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    record = ctx.user_data.get("pnl_record")
     if not record:
-        await update.message.reply_text(
-            "Session expired. Run `/pnl <CA>` again.", parse_mode="Markdown"
-        )
+        await update.message.reply_text("Session expired. Run `/pnl <CA>` again.", parse_mode="Markdown")
         return ConversationHandler.END
-
-    # Download the photo — use the highest resolution available
     try:
-        photo_file  = await update.message.photo[-1].get_file()
-        photo_bytes = await photo_file.download_as_bytearray()
+        f     = await update.message.photo[-1].get_file()
+        data  = await f.download_as_bytearray()
     except Exception as e:
-        logger.error(f"pnl photo download error: {e}")
+        log.error(f"pnl photo dl: {e}")
         await update.message.reply_text("❌ Could not download image. Try again.")
         return ConversationHandler.END
 
-    # Fetch current MC
     try:
-        dex_now    = await get_dex_data(record["address"])
-        current_mc = dex_now["mc"] if dex_now and dex_now["mc"] else record["mc"]
+        pump    = await enrich_from_pump(record["mint"])
+        curr_mc = pump.get("market_cap") or record["mc"]
     except Exception:
-        current_mc = record["mc"]
+        curr_mc = record["mc"]
 
-    msg = await update.message.reply_text("🎨 Generating your PNL card…")
+    msg = await update.message.reply_text("🎨 Generating PNL card…")
     try:
-        buf = make_pnl_card(
-            bg_bytes     = bytes(photo_bytes),
-            name         = record["name"],
-            symbol       = record["symbol"],
-            called_mc    = record["mc"],
-            current_mc   = current_mc,
-            called_at_ts = record["ts"],
-        )
-        mult     = (current_mc / record["mc"]) if record["mc"] and record["mc"] > 0 else 1.0
-        mult_str = f"{mult:.1f}x"
+        buf  = make_pnl_card(bytes(data), record["name"], record["symbol"],
+                             record["mc"], curr_mc, record["ts"])
+        mult = curr_mc / record["mc"] if record["mc"] > 0 else 1.0
         await update.message.reply_photo(
             photo      = buf,
             caption    = (
                 f"🚀 *{record['name']}* (${record['symbol']})\n"
-                f"Called at `${fmt(record['mc'])}` MC\n"
-                f"Now: `${fmt(current_mc)}` MC\n"
-                f"Performance: *{mult_str}*"
+                f"Called: `${fmt(record['mc'])}` → Now: `${fmt(curr_mc)}`\n"
+                f"Performance: *{mult:.1f}x*"
             ),
             parse_mode = "Markdown",
         )
         await msg.delete()
     except Exception as e:
-        logger.error(f"pnl_photo generation error: {e}")
-        await msg.edit_text(
-            "❌ Failed to generate the card. Try a different image (JPEG/PNG work best)."
-        )
+        log.error(f"pnl card gen: {e}")
+        await msg.edit_text("❌ Failed to generate card. Try a JPEG or PNG image.")
     finally:
-        # Clean up pending state
-        context.user_data.pop("pnl_record", None)
-
+        ctx.user_data.pop("pnl_record", None)
     return ConversationHandler.END
 
-async def pnl_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    context.user_data.pop("pnl_record", None)
+async def pnl_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int:
+    ctx.user_data.pop("pnl_record", None)
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
-async def msg_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    text = clean_addr(update.message.text.strip())
+async def msg_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = clean(update.message.text.strip())
     if re.match(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$", text) or re.match(r"^0x[0-9a-fA-F]{40}$", text):
-        context.args = [text]
-        await scan_cmd(update, context)
+        ctx.args = [text]
+        await cmd_scan(update, ctx)
     else:
         await update.message.reply_text("Send a contract address or use /scan <CA>.")
 
-# ════════════════════════════════════════════════════════════════════════════
-# REAL-TIME STREAM
-# ════════════════════════════════════════════════════════════════════════════
-
-async def stream_loop(app):
-    logger.info("Stream loop started — listening for new tokens")
-    while True:
-        try:
-            addresses = set()
-            sol_price = await get_sol_price()
-
-            profiles = await fetch(DEX_PROFILES)
-            if isinstance(profiles, list):
-                for p in profiles:
-                    a = clean_addr(p.get("tokenAddress") or p.get("address"))
-                    if a: addresses.add(a)
-
-            boosts = await fetch(DEX_BOOSTS)
-            if isinstance(boosts, list):
-                for b in boosts:
-                    a = clean_addr(b.get("tokenAddress") or b.get("address"))
-                    if a: addresses.add(a)
-
-            pump_list = await fetch(PUMP_COINS)
-            if isinstance(pump_list, list):
-                for coin in pump_list:
-                    a = clean_addr(coin.get("mint"))
-                    if a: addresses.add(a)
-
-            fresh = [a for a in addresses if a not in seen_tokens]
-
-            for addr in fresh:
-                seen_tokens[addr] = {"ts": time.time()}  # mark immediately to avoid double-processing
-
-                dex     = await get_dex_data(addr)
-                if not dex:
-                    continue
-                pump    = await get_pump_data(addr)
-                holders = await get_holders(addr)
-                fees    = await get_fees_paid(addr)
-                lp_usd  = await resolve_lp_usd(dex, pump, sol_price)
-                score, notes = score_token(dex, pump, holders, lp_usd)
-
-                passed, reason = passes_filters(dex, pump, holders, fees, lp_usd)
-                if not passed:
-                    logger.debug(f"Filtered {addr}: {reason}")
-                    continue
-
-                mc_val = dex["mc"] if dex["mc"] else (pump.get("market_cap_usd") if pump else 0)
-                record = {
-                    "address": addr,
-                    "name"   : dex["name"],
-                    "symbol" : dex["symbol"],
-                    "mc"     : mc_val,
-                    "price"  : dex["price"],
-                    "ts"     : time.time(),
-                    "score"  : score,
-                }
-                call_history.appendleft(record)
-                seen_tokens[addr].update({
-                    "name"          : dex["name"],
-                    "symbol"        : dex["symbol"],
-                    "mc"            : mc_val,
-                    "price"         : dex["price"],
-                    "next_milestone": 2,   # only alert at 2x and above
-                })
-
-                alert = build_alert(dex, pump, holders, fees, score, lp_usd)
-                if CHAT_ID:
-                    await app.bot.send_message(
-                        chat_id=CHAT_ID, text=alert,
-                        parse_mode="Markdown", disable_web_page_preview=True,
-                    )
-                logger.info(f"Alerted: {dex['name']} score={score} lp=${fmt(lp_usd)}")
-
-            await check_milestones(app)
-
-        except Exception as e:
-            logger.error(f"stream_loop error: {e}")
-
-        await asyncio.sleep(3)
-
-async def check_milestones(app):
-    """
-    Re-alert ONLY when token hits a clean milestone: 2x, 5x, 10x, 25x, 50x, 100x.
-    No alerts for anything below 2x — no random % updates.
-    Stops tracking after 48 hours.
-    """
-    now = time.time()
-    for addr, info in list(seen_tokens.items()):
-        if "mc" not in info or not info.get("next_milestone"):
-            continue
-        if now - info.get("ts", 0) > 172800:  # stop after 48h
-            info["next_milestone"] = None
-            continue
-
-        try:
-            dex = await get_dex_data(addr)
-        except Exception:
-            continue
-        if not dex:
-            continue
-
-        orig      = info["mc"]
-        curr      = dex["mc"]
-        if not orig or not curr:
-            continue
-
-        mult      = curr / orig
-        milestone = info["next_milestone"]
-
-        if mult >= milestone:
-            # Advance to next milestone
-            next_m = next((m for m in PUMP_MILESTONES if m > milestone), None)
-            info["next_milestone"] = next_m
-
-            if CHAT_ID:
-                try:
-                    await app.bot.send_message(
-                        chat_id=CHAT_ID,
-                        text=(
-                            f"🚀 *{milestone}x MILESTONE — {info['name']}*\n"
-                            f"Called at `${fmt(orig)}` MC\n"
-                            f"Now: `${fmt(curr)}` MC\n"
-                            f"📈 *{mult:.1f}x* from call\n"
-                            f"CA: `{addr}`"
-                        ),
-                        parse_mode="Markdown",
-                    )
-                except Exception as e:
-                    logger.error(f"milestone alert error: {e}")
-
-# ════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
-# ════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
     threading.Thread(target=run_flask, daemon=True).start()
-    logger.info("Flask started")
+    log.info("Flask health server started")
 
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TG_TOKEN).build()
 
     pnl_conv = ConversationHandler(
-        entry_points  = [CommandHandler("pnl", pnl_cmd)],
-        states        = {
-            WAIT_PHOTO: [
-                MessageHandler(filters.PHOTO, pnl_photo),
-                CommandHandler("cancel", pnl_cancel),
-            ]
-        },
+        entry_points  = [CommandHandler("pnl", cmd_pnl)],
+        states        = {WAIT_PHOTO: [
+            MessageHandler(tg_filters.PHOTO, pnl_photo),
+            CommandHandler("cancel", pnl_cancel),
+        ]},
         fallbacks     = [CommandHandler("cancel", pnl_cancel)],
         allow_reentry = True,
-        # Ensure the conversation persists across restarts if persistence is added later
-        name          = "pnl_conversation",
+        name          = "pnl_conv",
     )
 
-    app.add_handler(CommandHandler("start",  start))
-    app.add_handler(CommandHandler("scan",   scan_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("calls",  calls_cmd))
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("scan",   cmd_scan))
+    app.add_handler(CommandHandler("calls",  cmd_calls))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(pnl_conv)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, msg_handler))
+    app.add_handler(MessageHandler(tg_filters.TEXT & ~tg_filters.COMMAND, msg_handler))
 
     async def post_init(application):
-        asyncio.create_task(stream_loop(application))
+        asyncio.create_task(refresh_sol_price())
+        asyncio.create_task(pump_ws_loop(application))
+        asyncio.create_task(helius_ws_loop(application))
+        asyncio.create_task(milestone_poll_loop(application))
+        asyncio.create_task(cleanup_loop())
+        log.info("All streams running ✓")
 
     app.post_init = post_init
-
-    logger.info("GemStalker live")
+    log.info("GemStalker starting — pre-migration mode")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":

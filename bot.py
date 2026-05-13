@@ -23,20 +23,20 @@ CHAT_ID  = os.getenv("CHAT_ID")
 
 PUMP_WS  = "wss://pumpportal.fun/api/data"
 
-SOL_PRICE = 95.0  # updated live every 60s
+SOL_PRICE = 95.0  # updated live every 60s from CoinGecko
 
-# Solana CA pattern: base58, 32-44 chars
-SOLANA_CA_RE = re.compile(r"[1-9A-HJ-NP-Za-km-z]{32,44}")
+# Solana CA: base58, 32-44 chars
+SOLANA_CA_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 
 # =========================================================
-# FILTERS  (relaxed for testing — tighten after confirming alerts work)
+# FILTERS  (relaxed — tighten once alerts confirmed firing)
 # =========================================================
 
 MC_MIN           = 3_000    # USD
 MC_MAX           = 500_000  # USD
-MIN_SOL_IN       = 0.3      # SOL
+MIN_SOL_IN       = 0.3      # SOL cumulative buy inflow
 MIN_BUYS         = 2        # total buys seen
-MIN_BUYS_PER_MIN = 0.5      # per real 60s window
+MIN_BUYS_PER_MIN = 0.5      # real 60s window
 
 # =========================================================
 # LOGGING
@@ -60,7 +60,7 @@ class Token:
     symbol: str = "?"
 
     market_cap:    float = 0.0
-    sol_in:        float = 0.0  # cumulative buy inflow
+    sol_in:        float = 0.0   # cumulative buy inflow (SOL)
     bonding_curve: float = 0.0
 
     holders:    int   = 0
@@ -78,14 +78,12 @@ class Token:
     created_at:  float = field(default_factory=time.time)
     last_active: float = field(default_factory=time.time)
 
-    # timestamps of buys in last 5 min for real bpm calc
     buys: deque = field(default_factory=lambda: deque(maxlen=500))
 
 
-tokens: dict       = {}
+tokens: dict        = {}
 recent_calls: deque = deque(maxlen=20)
 
-# stats
 event_counter = 0
 buy_counter   = 0
 
@@ -111,17 +109,16 @@ async def update_sol_price() -> None:
 # HELPERS
 # =========================================================
 
-def fmt(n) -> str:
+def fmt(n, decimals: int = 2) -> str:
     n = float(n)
     if n >= 1_000_000:
-        return f"{n / 1_000_000:.2f}M"
+        return f"{n / 1_000_000:.{decimals}f}M"
     if n >= 1_000:
-        return f"{n / 1_000:.2f}K"
-    return f"{n:.2f}"
+        return f"{n / 1_000:.{decimals}f}K"
+    return f"{n:.{decimals}f}"
 
 
 def buys_per_min(t: Token) -> float:
-    """Real 60-second window."""
     cutoff = time.time() - 60
     return float(sum(1 for x in t.buys if x >= cutoff))
 
@@ -139,7 +136,7 @@ def token_age_str(t: Token) -> str:
         return f"{secs}s"
     if secs < 3600:
         return f"{secs // 60}m"
-    return f"{secs // 3600}h"
+    return f"{secs // 3600}h {(secs % 3600) // 60}m"
 
 
 def alpha_score(t: Token) -> float:
@@ -155,7 +152,6 @@ def alpha_score(t: Token) -> float:
 
 
 def passes_filters(t: Token) -> tuple:
-    """Returns (passes: bool, reason: str)"""
     if t.market_cap < MC_MIN:
         return False, f"MC too low (${fmt(t.market_cap)} < ${fmt(MC_MIN)})"
     if t.market_cap > MC_MAX:
@@ -174,66 +170,335 @@ def passes_filters(t: Token) -> tuple:
 # =========================================================
 
 async def cleanup_tokens() -> None:
-    """Remove tokens inactive for 45 minutes to prevent memory bloat."""
     while True:
-        await asyncio.sleep(300)  # run every 5 minutes
-        cutoff  = time.time() - 2700  # 45 minutes
-        stale   = [m for m, t in tokens.items() if t.last_active < cutoff]
+        await asyncio.sleep(300)
+        cutoff = time.time() - 2700  # 45 minutes
+        stale  = [m for m, t in tokens.items() if t.last_active < cutoff]
         for m in stale:
             del tokens[m]
         if stale:
-            log.info(f"[CLEANUP] Removed {len(stale)} stale tokens. Tracking: {len(tokens)}")
+            log.info(f"[CLEANUP] Removed {len(stale)} stale tokens. Active: {len(tokens)}")
 
 # =========================================================
-# EVENT STATS LOGGER
+# STATS LOGGER
 # =========================================================
 
 async def log_stats() -> None:
-    """Log events/min and buy count every 60s."""
     global event_counter, buy_counter
     while True:
         await asyncio.sleep(60)
         log.info(
-            f"[STATS] Events last 60s: {event_counter} | "
-            f"Buys: {buy_counter} | "
-            f"Tokens tracked: {len(tokens)} | "
-            f"Alerts sent: {sum(1 for t in tokens.values() if t.called)}"
+            f"[STATS] Events/min: {event_counter} | Buys: {buy_counter} | "
+            f"Tokens: {len(tokens)} | Alerts: {sum(1 for t in tokens.values() if t.called)}"
         )
         event_counter = 0
         buy_counter   = 0
 
 # =========================================================
-# ALERT MESSAGE
+# PAIR SELECTION  (volume-first, not liquidity-first)
+# =========================================================
+
+def score_pair(pair: dict) -> float:
+    """
+    Score a DexScreener pair for freshness/relevance.
+    Priority: active txns > volume > liquidity.
+    Do NOT rely on liquidity alone — it's often null on fresh launches.
+    """
+    txns   = pair.get("txns") or {}
+    vol    = pair.get("volume") or {}
+    liq    = pair.get("liquidity") or {}
+
+    buys1  = int((txns.get("h1") or {}).get("buys",  0))
+    sells1 = int((txns.get("h1") or {}).get("sells", 0))
+    vol1   = float(vol.get("h1",  0) or 0)
+    vol24  = float(vol.get("h24", 0) or 0)
+    liq_usd = float(liq.get("usd", 0) or 0)
+
+    return (buys1 + sells1) * 10 + vol1 * 0.01 + vol24 * 0.001 + liq_usd * 0.001
+
+
+def best_sol_pair(pairs: list) -> dict | None:
+    sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
+    if not sol_pairs:
+        return None
+    return max(sol_pairs, key=score_pair)
+
+# =========================================================
+# CA ANALYZER — API LAYER
+# =========================================================
+
+async def fetch_dexscreener(ca: str) -> dict | None:
+    url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            r    = await client.get(url)
+            data = r.json()
+            pairs = data.get("pairs") or []
+            if pairs:
+                pair = best_sol_pair(pairs)
+                if pair:
+                    log.info(f"[DEX] Found pair for {ca[:10]}.. via DexScreener")
+                    return pair
+    except Exception as e:
+        log.warning(f"[DEX] DexScreener failed for {ca[:10]}: {e}")
+    return None
+
+
+async def fetch_geckoterminal(ca: str) -> dict | None:
+    """Fallback: GeckoTerminal — free, no key needed."""
+    url = f"https://api.geckoterminal.com/api/v2/networks/solana/tokens/{ca}/pools?page=1"
+    try:
+        async with httpx.AsyncClient(timeout=12) as client:
+            r    = await client.get(url, headers={"Accept": "application/json"})
+            data = r.json()
+            pools = (data.get("data") or [])
+            if pools:
+                # pick pool with highest 24h volume
+                best = max(
+                    pools,
+                    key=lambda p: float(
+                        (p.get("attributes") or {}).get("volume_usd", {}).get("h24", 0) or 0
+                    )
+                )
+                attrs = best.get("attributes") or {}
+                log.info(f"[GECKO] Found pool for {ca[:10]}.. via GeckoTerminal")
+                return {"_source": "gecko", "_attrs": attrs, "_ca": ca}
+    except Exception as e:
+        log.warning(f"[GECKO] GeckoTerminal failed for {ca[:10]}: {e}")
+    return None
+
+
+def safe_liq(pair: dict):
+    """
+    Return liquidity USD or None.
+    NEVER return 0 when liquidity is simply unavailable.
+    """
+    liq = pair.get("liquidity")
+    if not liq or not isinstance(liq, dict):
+        return None
+    val = liq.get("usd")
+    if val is None:
+        return None
+    try:
+        f = float(val)
+        return f if f > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+# =========================================================
+# CA ANALYZER — ANALYSIS LOGIC
+# =========================================================
+
+def analyze_dex_pair(ca: str, pair: dict) -> str:
+    base   = pair.get("baseToken") or {}
+    name   = base.get("name",   "Unknown")
+    symbol = base.get("symbol", "?")
+
+    mc     = float(pair.get("marketCap") or pair.get("fdv") or 0)
+    liq    = safe_liq(pair)                          # None = pending
+    txns   = pair.get("txns")   or {}
+    vol    = pair.get("volume") or {}
+
+    buys1   = int((txns.get("h1")  or {}).get("buys",   0))
+    sells1  = int((txns.get("h1")  or {}).get("sells",  0))
+    buys24  = int((txns.get("h24") or {}).get("buys",   0))
+    sells24 = int((txns.get("h24") or {}).get("sells",  0))
+    vol1    = float(vol.get("h1",  0) or 0)
+    vol24   = float(vol.get("h24", 0) or 0)
+    pc1h    = float((pair.get("priceChange") or {}).get("h1",  0) or 0)
+    pc24h   = float((pair.get("priceChange") or {}).get("h24", 0) or 0)
+
+    total1 = buys1 + sells1
+    pressure = int((buys1 / total1) * 100) if total1 else 0
+
+    liq_str = f"${fmt(liq)}" if liq is not None else "Pending"
+
+    # ---- safety flags (ONLY flag liq if confirmed low, not None) ----
+    flags = []
+    if liq is not None and liq < 5_000:
+        flags.append("Low liquidity")
+    if vol24 < 500:
+        flags.append("Near-zero volume")
+    if total1 > 0 and sells1 > buys1 * 2:
+        flags.append("Heavy sell pressure")
+    if buys1 == 0 and sells1 == 0:
+        flags.append("No activity last hour")
+    if liq is not None and mc > 0 and (liq / mc) < 0.02:
+        flags.append("Thin liq vs MC")
+
+    # ---- AI reads (3-4 bullets max) ----
+    reads = []
+    if pressure > 68:
+        reads.append("Buyers aggressive")
+    elif pressure < 35:
+        reads.append("Sellers dominating")
+    if pc1h > 15:
+        reads.append("Strong momentum last hour")
+    elif pc1h < -15:
+        reads.append("Dumping last hour")
+    if vol1 > vol24 * 0.3:
+        reads.append("Volume accelerating")
+    if mc < 50_000:
+        reads.append("Very early stage")
+    elif mc < 300_000:
+        reads.append("Still early")
+    if liq is None:
+        reads.append("Liquidity data pending")
+    if not reads:
+        reads.append("No strong signal")
+    reads = reads[:4]
+
+    # ---- status rating ----
+    bad = len(flags)
+    if bad == 0 and pressure > 60 and vol1 > 3_000:
+        status = "🟢 RUNNER"
+    elif bad >= 3 or (total1 > 5 and sells1 > buys1 * 2):
+        status = "🔴 AVOID"
+    elif bad >= 1 or pressure < 45:
+        status = "🟠 SPECULATIVE"
+    else:
+        status = "🟡 WATCHLIST"
+
+    reads_fmt = "\n".join(f"• {r}" for r in reads)
+    flags_fmt = "\n".join(f"⚠️ {f}" for f in flags) if flags else "• No major red flags"
+
+    dex    = f"https://dexscreener.com/solana/{ca}"
+    photon = f"https://photon-sol.tinyastro.io/en/lp/{ca}"
+    bullx  = f"https://bullx.io/terminal?chainId=1399811149&address={ca}"
+
+    return (
+        f"━━━━━━━━━━━━━━\n"
+        f"🪙 {name} ({symbol})\n\n"
+        f"MC      • {('$' + fmt(mc)) if mc else 'N/A'}\n"
+        f"LIQ     • {liq_str}\n"
+        f"VOL 1H  • ${fmt(vol1)}\n"
+        f"VOL 24H • ${fmt(vol24)}\n"
+        f"PRESSURE• {pressure}%\n\n"
+        f"BUY/SELL• {buys1} / {sells1}  (1h)\n"
+        f"CHANGE  • {pc1h:+.1f}%  (1h)  {pc24h:+.1f}%  (24h)\n\n"
+        f"SAFETY\n{flags_fmt}\n\n"
+        f"AI READ\n{reads_fmt}\n\n"
+        f"STATUS\n{status}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"[Dex]({dex})  •  [Photon]({photon})  •  [BullX]({bullx})"
+    )
+
+
+def analyze_gecko_data(ca: str, gecko: dict) -> str:
+    attrs  = gecko.get("_attrs") or {}
+    name   = attrs.get("name", "Unknown")
+    symbol = (attrs.get("base_token_price_usd") and "") or "?"
+
+    mc     = float(attrs.get("market_cap_usd") or 0)
+    liq    = float(attrs.get("reserve_in_usd") or 0) or None
+    vol24  = float((attrs.get("volume_usd") or {}).get("h24", 0) or 0)
+
+    liq_str = f"${fmt(liq)}" if liq else "Pending"
+
+    dex    = f"https://dexscreener.com/solana/{ca}"
+    photon = f"https://photon-sol.tinyastro.io/en/lp/{ca}"
+    bullx  = f"https://bullx.io/terminal?chainId=1399811149&address={ca}"
+
+    return (
+        f"━━━━━━━━━━━━━━\n"
+        f"🪙 {name} (via GeckoTerminal)\n\n"
+        f"MC      • {('$' + fmt(mc)) if mc else 'N/A'}\n"
+        f"LIQ     • {liq_str}\n"
+        f"VOL 24H • ${fmt(vol24)}\n\n"
+        f"AI READ\n• Limited data — token may be very new\n\n"
+        f"STATUS\n🟡 WATCHLIST\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"[Dex]({dex})  •  [Photon]({photon})  •  [BullX]({bullx})"
+    )
+
+
+async def analyze_ca(ca: str) -> str:
+    log.info(f"[CA] Analyzing: {ca}")
+
+    # Try DexScreener first
+    pair = await fetch_dexscreener(ca)
+    if pair:
+        return analyze_dex_pair(ca, pair)
+
+    # Fallback: GeckoTerminal
+    gecko = await fetch_geckoterminal(ca)
+    if gecko:
+        return analyze_gecko_data(ca, gecko)
+
+    # Nothing found
+    dex = f"https://dexscreener.com/solana/{ca}"
+    return (
+        f"━━━━━━━━━━━━━━\n"
+        f"❓ No data found\n\n"
+        f"{ca}\n\n"
+        f"Token may be too new or not yet indexed.\n"
+        f"Check manually: {dex}\n"
+        f"━━━━━━━━━━━━━━"
+    )
+
+# =========================================================
+# GEM ALERT MESSAGE  (clean sniper-terminal UI)
 # =========================================================
 
 def build_alert(t: Token) -> str:
-    pressure     = buy_pressure(t)
-    net_flow     = t.buy_volume - t.sell_volume
-    migration    = "Raydium" if t.migrated else "Bonding Curve"
-    score        = alpha_score(t)
-    holders_str  = str(t.holders) if t.holders else "N/A"
-    top_str      = f"{t.top_holder:.1f}%" if t.top_holder else "N/A"
-    bpm          = buys_per_min(t)
+    pressure  = buy_pressure(t)
+    net_flow  = t.buy_volume - t.sell_volume
+    score     = alpha_score(t)
+    bpm       = buys_per_min(t)
+    holders   = str(t.holders) if t.holders else "N/A"
+    top       = f"{t.top_holder:.1f}%" if t.top_holder else "N/A"
+    status    = "Raydium" if t.migrated else "Bonding Curve"
+
+    # status label
+    if score >= 7:
+        label = "🟢 RUNNER"
+    elif score >= 5:
+        label = "🟡 WATCHLIST"
+    elif score >= 3:
+        label = "🟠 SPECULATIVE"
+    else:
+        label = "🔴 AVOID"
+
+    # AI reads from live data
+    reads = []
+    if pressure > 68:
+        reads.append("Buyers aggressive")
+    elif pressure < 35:
+        reads.append("Sell pressure present")
+    if bpm > 5:
+        reads.append("High buy frequency")
+    if net_flow > 0:
+        reads.append("Net positive buy flow")
+    elif net_flow < -0.5:
+        reads.append("Net outflow — caution")
+    if t.sol_in > 5:
+        reads.append("Strong accumulation")
+    if not reads:
+        reads.append("Momentum building")
+    reads = reads[:4]
+
+    reads_fmt = "\n".join(f"• {r}" for r in reads)
 
     return (
-        "🚨 EARLY GEM DETECTED 🚨\n\n"
-        f"🪙 Token: {t.name} ({t.symbol})\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"🚨 GEM DETECTED\n\n"
+        f"🪙 {t.name} ({t.symbol})\n"
         f"⏱ Age: {token_age_str(t)}\n\n"
-        f"💰 Market Cap:     ${fmt(t.market_cap)}\n"
-        f"💧 Buy Inflow:     {t.sol_in:.3f} SOL\n"
-        f"🔄 Net Buy Flow:   {net_flow:.3f} SOL\n"
-        f"📊 Total Volume:   {t.buy_volume + t.sell_volume:.3f} SOL\n"
-        f"👥 Holders:        {holders_str}\n"
-        f"📈 Buy Pressure:   {pressure}%\n"
-        f"⚡ Buys/Sells:     {t.buy_count} / {t.sell_count}\n"
-        f"🔥 Buys/Min:       {bpm:.1f}\n"
-        f"🏆 Top Holder:     {top_str}\n"
-        f"🚀 Status:         {migration}\n"
-        f"⭐ Alpha Score:    {score}/10\n\n"
-        f"💵 SOL:            ${SOL_PRICE:.2f}\n\n"
-        "━━━━━━━━━━━━━━━\n"
-        f"📍 Contract:\n{t.mint}\n"
-        "━━━━━━━━━━━━━━━"
+        f"MC       • ${fmt(t.market_cap)}\n"
+        f"INFLOW   • {t.sol_in:.2f} SOL\n"
+        f"NET FLOW • {net_flow:+.2f} SOL\n"
+        f"VOLUME   • {t.buy_volume + t.sell_volume:.2f} SOL\n"
+        f"PRESSURE • {pressure}%\n\n"
+        f"BUY/SELL • {t.buy_count} / {t.sell_count}\n"
+        f"B/MIN    • {bpm:.1f}\n"
+        f"HOLDERS  • {holders}\n"
+        f"TOP HOLD • {top}\n"
+        f"STATUS   • {status}\n"
+        f"SCORE    • {score}/10\n\n"
+        f"AI READ\n{reads_fmt}\n\n"
+        f"SIGNAL\n{label}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"`{t.mint}`"
     )
 
 # =========================================================
@@ -249,9 +514,7 @@ async def send_alert(app: Application, t: Token) -> None:
         [
             InlineKeyboardButton("⚡ Photon",      url=photon),
             InlineKeyboardButton("🐂 BullX",       url=bullx),
-        ],
-        [
-            InlineKeyboardButton("📊 DexScreener", url=dex),
+            InlineKeyboardButton("📊 Dex",         url=dex),
         ],
     ])
 
@@ -259,6 +522,7 @@ async def send_alert(app: Application, t: Token) -> None:
         await app.bot.send_message(
             chat_id=CHAT_ID,
             text=build_alert(t),
+            parse_mode="Markdown",
             disable_web_page_preview=True,
             reply_markup=keyboard,
         )
@@ -270,144 +534,25 @@ async def send_alert(app: Application, t: Token) -> None:
             "score":      alpha_score(t),
             "time":       time.time(),
         })
-        log.info(f"[ALERT SENT] {t.name} ({t.symbol}) | MC=${fmt(t.market_cap)}")
+        log.info(f"[ALERT SENT] {t.name} ({t.symbol}) MC=${fmt(t.market_cap)}")
     except Exception as e:
-        log.error(f"[ALERT ERROR] Failed to send: {e}")
+        log.error(f"[ALERT ERROR] {e}")
 
 # =========================================================
-# CA ANALYZER
-# =========================================================
-
-async def fetch_dexscreener(ca: str) -> dict | None:
-    url = f"https://api.dexscreener.com/latest/dex/tokens/{ca}"
-    try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r    = await client.get(url)
-            data = r.json()
-            pairs = data.get("pairs")
-            if pairs:
-                # pick Solana pair with highest liquidity
-                sol_pairs = [p for p in pairs if p.get("chainId") == "solana"]
-                if sol_pairs:
-                    return max(sol_pairs, key=lambda p: float(p.get("liquidity", {}).get("usd", 0)))
-    except Exception as e:
-        log.warning(f"[DEX] DexScreener failed for {ca}: {e}")
-    return None
-
-
-def analyze_pair(ca: str, pair: dict) -> str:
-    base    = pair.get("baseToken", {})
-    name    = base.get("name", "Unknown")
-    symbol  = base.get("symbol", "?")
-
-    mc      = float(pair.get("marketCap", 0) or pair.get("fdv", 0) or 0)
-    liq     = float((pair.get("liquidity") or {}).get("usd", 0))
-    vol24   = float((pair.get("volume") or {}).get("h24", 0))
-    vol1    = float((pair.get("volume") or {}).get("h1", 0))
-    buys1   = int((pair.get("txns") or {}).get("h1", {}).get("buys", 0))
-    sells1  = int((pair.get("txns") or {}).get("h1", {}).get("sells", 0))
-    buys24  = int((pair.get("txns") or {}).get("h24", {}).get("buys", 0))
-    sells24 = int((pair.get("txns") or {}).get("h24", {}).get("sells", 0))
-    price_change_1h  = float((pair.get("priceChange") or {}).get("h1", 0) or 0)
-    price_change_24h = float((pair.get("priceChange") or {}).get("h24", 0) or 0)
-
-    total_txns = buys1 + sells1
-    pressure   = int((buys1 / total_txns) * 100) if total_txns else 0
-
-    dex   = f"https://dexscreener.com/solana/{ca}"
-    photon = f"https://photon-sol.tinyastro.io/en/lp/{ca}"
-    bullx = f"https://bullx.io/terminal?chainId=1399811149&address={ca}"
-
-    # ---- rug / safety checks ----
-    flags = []
-    if liq < 5000:
-        flags.append("⚠️ Liquidity very low")
-    if vol24 < 1000:
-        flags.append("⚠️ Volume dead (<$1K/24h)")
-    if sells1 > buys1 * 2:
-        flags.append("⚠️ Heavy sell pressure")
-    if buys1 == 0 and sells1 == 0:
-        flags.append("⚠️ No activity in last hour")
-    if mc > 0 and liq > 0 and (liq / mc) < 0.02:
-        flags.append("⚠️ Thin liquidity vs MC")
-
-    # ---- rating ----
-    red_flags = len(flags)
-    if red_flags == 0 and pressure > 65 and vol1 > 5000:
-        rating = "✅ RUNNER POTENTIAL"
-    elif red_flags >= 3 or (sells1 > buys1 * 2):
-        rating = "❌ AVOID"
-    else:
-        rating = "⚠️ HIGH RISK"
-
-    # ---- AI read ----
-    reads = []
-    if pressure > 70:
-        reads.append("Momentum strong")
-    elif pressure < 40:
-        reads.append("Sell pressure dominant")
-    if price_change_1h > 20:
-        reads.append("Pumping hard in last hour")
-    elif price_change_1h < -20:
-        reads.append("Dumping in last hour")
-    if mc < 50_000:
-        reads.append("Early stage — high risk, high reward")
-    elif mc < 500_000:
-        reads.append("Mid cap — still early")
-    if liq < 10_000:
-        reads.append("Low liquidity — slippage risk")
-    if not reads:
-        reads.append("No strong signal detected")
-
-    flags_str = "\n".join(flags) if flags else "No major red flags"
-    reads_str = "\n  ".join(reads)
-
-    vol_label = "High" if vol24 > 50_000 else "Medium" if vol24 > 5_000 else "Low"
-
-    return (
-        f"🪙 {name} ({symbol})\n\n"
-        f"💰 MC: ${fmt(mc)}\n"
-        f"💧 Liquidity: ${fmt(liq)}\n"
-        f"📈 Volume 1h: ${fmt(vol1)} | 24h: ${fmt(vol24)} ({vol_label})\n"
-        f"📊 Buys/Sells 1h: {buys1} / {sells1}\n"
-        f"🔥 Buy Pressure: {pressure}%\n"
-        f"📉 Price Change: 1h {price_change_1h:+.1f}% | 24h {price_change_24h:+.1f}%\n\n"
-        f"Safety Check:\n{flags_str}\n\n"
-        f"AI Read:\n  {reads_str}\n\n"
-        f"Rating: {rating}\n\n"
-        f"🔗 Dex: {dex}\n"
-        f"⚡ Photon: {photon}\n"
-        f"🐂 BullX: {bullx}"
-    )
-
-
-async def analyze_ca(ca: str) -> str:
-    log.info(f"[CA] Analyzing: {ca}")
-    pair = await fetch_dexscreener(ca)
-    if pair:
-        return analyze_pair(ca, pair)
-    return (
-        f"Could not find data for:\n{ca}\n\n"
-        "Token may be too new or not yet listed on DexScreener.\n"
-        f"Try manually: https://dexscreener.com/solana/{ca}"
-    )
-
-# =========================================================
-# COMMAND HANDLERS
+# COMMANDS
 # =========================================================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "👋 GemStalker is live!\n\n"
         "Scanning pump.fun in real-time.\n"
-        "Alerts fire here when a gem passes filters.\n\n"
+        "Paste any Solana CA for instant analysis.\n\n"
         "Commands:\n"
-        "  /start    - This message\n"
-        "  /status   - Live tracking stats\n"
-        "  /calls    - Last 20 alerts\n"
-        "  /filters  - Current filter settings\n"
-        "  /analyze  - Analyze a Solana CA\n\n"
-        "Tip: Paste any Solana CA directly and I will analyze it instantly."
+        "  /start    — This message\n"
+        "  /status   — Live tracking stats\n"
+        "  /calls    — Last 20 alerts\n"
+        "  /filters  — Current filter settings\n"
+        "  /analyze  — Analyze a CA"
     )
 
 
@@ -424,22 +569,22 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     msg = (
         "📡 GemStalker Status\n\n"
-        f"  Tokens tracked:  {total}\n"
-        f"  Alerts sent:     {alerted}\n"
-        f"  Still watching:  {watching}\n"
-        f"  SOL Price:       ${SOL_PRICE:.2f} (live)\n"
+        f"Tokens tracked:  {total}\n"
+        f"Alerts sent:     {alerted}\n"
+        f"Still watching:  {watching}\n"
+        f"SOL Price:       ${SOL_PRICE:.2f}\n"
     )
 
     if candidates:
         msg += "\nTop candidates:\n"
         for t in candidates:
-            passed, reason = passes_filters(t)
-            bpm = buys_per_min(t)
+            _, reason = passes_filters(t)
             msg += (
-                f"  {t.name} ({t.symbol})\n"
-                f"    MC:${fmt(t.market_cap)} | Inflow:{t.sol_in:.2f} SOL"
-                f" | Buys:{t.buy_count} | B/min:{bpm:.1f}\n"
-                f"    Blocking: {reason}\n"
+                f"\n{t.name} ({t.symbol})\n"
+                f"  MC:${fmt(t.market_cap)} | "
+                f"Inflow:{t.sol_in:.2f} SOL | "
+                f"Buys:{t.buy_count}\n"
+                f"  Blocking: {reason}\n"
             )
 
     await update.message.reply_text(msg)
@@ -448,8 +593,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_calls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not recent_calls:
         await update.message.reply_text(
-            "No calls yet. Watching the market...\n"
-            "Use /status to see top candidates."
+            "No calls yet.\nUse /status to see top candidates."
         )
         return
 
@@ -459,7 +603,8 @@ async def cmd_calls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         age_str = f"{age_min}m ago" if age_min < 60 else f"{age_min // 60}h ago"
         lines.append(
             f"{i}. {c['name']} ({c['symbol']})\n"
-            f"   MC: ${fmt(c['market_cap'])} | Score: {c['score']}/10 | {age_str}\n"
+            f"   MC: ${fmt(c['market_cap'])} | "
+            f"Score: {c['score']}/10 | {age_str}\n"
             f"   {c['mint'][:20]}...\n"
         )
     await update.message.reply_text("\n".join(lines))
@@ -467,51 +612,56 @@ async def cmd_calls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "⚙️ Current Filters:\n\n"
-        f"  Market Cap:      ${fmt(MC_MIN)} - ${fmt(MC_MAX)}\n"
-        f"  Min Buy Inflow:  {MIN_SOL_IN} SOL\n"
-        f"  Min Buys:        {MIN_BUYS}\n"
-        f"  Min Buys/Min:    {MIN_BUYS_PER_MIN}\n\n"
-        f"  SOL Price:       ${SOL_PRICE:.2f} (live)\n\n"
-        "Holders/top holder not filtered\n"
-        "(pump.fun rarely sends that data in live trade events)"
+        "⚙️ Active Filters:\n\n"
+        f"Market Cap:      ${fmt(MC_MIN)} - ${fmt(MC_MAX)}\n"
+        f"Min Buy Inflow:  {MIN_SOL_IN} SOL\n"
+        f"Min Buys:        {MIN_BUYS}\n"
+        f"Min Buys/Min:    {MIN_BUYS_PER_MIN}\n\n"
+        f"SOL Price:       ${SOL_PRICE:.2f} (live)\n\n"
+        "Note: Holders/top holder not filtered\n"
+        "(rarely available in live pump.fun events)"
     )
 
 
 async def cmd_analyze(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    args = context.args
-    if not args:
+    if not context.args:
         await update.message.reply_text(
-            "Usage: /analyze <contract_address>\nExample: /analyze EPjFWdd5..."
+            "Usage: /analyze <contract_address>"
         )
         return
 
-    ca = args[0].strip()
-    if not SOLANA_CA_RE.fullmatch(ca):
+    ca = context.args[0].strip()
+    if not SOLANA_CA_RE.search(ca):
         await update.message.reply_text("That doesn't look like a valid Solana CA.")
         return
 
     msg = await update.message.reply_text("🔍 Analyzing...")
     result = await analyze_ca(ca)
-    await msg.edit_text(result, disable_web_page_preview=True)
+    try:
+        await msg.edit_text(result, parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception:
+        await msg.edit_text(result, disable_web_page_preview=True)
 
 
 async def handle_ca_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Auto-detect Solana CA pasted directly into chat."""
     text = (update.message.text or "").strip()
-    match = SOLANA_CA_RE.fullmatch(text)
-    if not match:
-        # also try to find a CA embedded in a longer message
+
+    # full message is a CA
+    if SOLANA_CA_RE.fullmatch(text):
+        ca = text
+    else:
+        # CA embedded in a message
         matches = SOLANA_CA_RE.findall(text)
         if not matches:
             return
         ca = matches[0]
-    else:
-        ca = text
 
     msg = await update.message.reply_text(f"🔍 Analyzing {ca[:12]}...")
     result = await analyze_ca(ca)
-    await msg.edit_text(result, disable_web_page_preview=True)
+    try:
+        await msg.edit_text(result, parse_mode="Markdown", disable_web_page_preview=True)
+    except Exception:
+        await msg.edit_text(result, disable_web_page_preview=True)
 
 # =========================================================
 # EVENT HANDLER
@@ -528,10 +678,9 @@ async def handle_event(app: Application, msg: dict) -> None:
     if not mint:
         return
 
-    # log raw incoming buys/sells at DEBUG level so logs don't flood
     if tx_type in ("buy", "sell"):
         log.debug(
-            f"[{tx_type.upper()}] mint={mint[:8]}.. "
+            f"[{tx_type.upper()}] {mint[:8]}.. "
             f"mcSol={msg.get('marketCapSol', '?')} "
             f"sol={msg.get('solAmount', '?')}"
         )
@@ -539,11 +688,10 @@ async def handle_event(app: Application, msg: dict) -> None:
     if mint not in tokens:
         tokens[mint] = Token(mint=mint)
 
-    t = tokens[mint]
+    t             = tokens[mint]
     t.last_active = time.time()
-
-    t.name   = msg.get("name",   t.name)
-    t.symbol = msg.get("symbol", t.symbol)
+    t.name        = msg.get("name",   t.name)
+    t.symbol      = msg.get("symbol", t.symbol)
 
     market_cap_sol = float(msg.get("marketCapSol", 0) or 0)
     t.market_cap   = market_cap_sol * SOL_PRICE
@@ -581,7 +729,6 @@ async def handle_event(app: Application, msg: dict) -> None:
             log.info(f"[PASS] {t.name} ({t.symbol}) MC=${fmt(t.market_cap)}")
             await send_alert(app, t)
         elif tx_type == "buy" and t.buy_count % 5 == 0:
-            # log filter failure every 5 buys so we can see what's blocking
             log.info(
                 f"[FAIL] {t.name} ({t.symbol}) | "
                 f"MC=${fmt(t.market_cap)} | Inflow={t.sol_in:.3f} | "
@@ -607,7 +754,6 @@ async def websocket_loop(app: Application) -> None:
                 reconnect_count = 0
                 log.info("[WS] Connected to pumpportal.fun")
 
-                # Subscribe to new tokens AND all token trades
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
                 log.info("[WS] Subscribed: subscribeNewToken")
 
@@ -620,20 +766,21 @@ async def websocket_loop(app: Application) -> None:
                         msg = json.loads(raw)
                         await handle_event(app, msg)
 
-                        # heartbeat log every 30s to confirm stream is alive
                         if time.time() - heartbeat > 30:
                             heartbeat = time.time()
                             log.info(
-                                f"[WS HEARTBEAT] Stream alive | "
-                                f"Events: {event_counter} | Tokens: {len(tokens)}"
+                                f"[WS HEARTBEAT] alive | "
+                                f"events={event_counter} tokens={len(tokens)}"
                             )
+                    except json.JSONDecodeError as e:
+                        log.warning(f"[WS] Bad JSON: {e}")
                     except Exception as e:
-                        log.error(f"[WS] Event parse error: {e}")
+                        log.error(f"[WS] Event error: {e}")
 
         except Exception as e:
             reconnect_count += 1
             wait = min(5 * reconnect_count, 30)
-            log.error(f"[WS] Disconnected: {e} — reconnecting in {wait}s")
+            log.error(f"[WS] Disconnected: {e} — retry in {wait}s")
             await asyncio.sleep(wait)
 
 # =========================================================
@@ -641,12 +788,12 @@ async def websocket_loop(app: Application) -> None:
 # =========================================================
 
 async def post_init(app: Application) -> None:
-    log.info("[INIT] Starting background tasks...")
+    log.info("[INIT] Launching background tasks...")
     asyncio.create_task(update_sol_price())
     asyncio.create_task(websocket_loop(app))
     asyncio.create_task(cleanup_tokens())
     asyncio.create_task(log_stats())
-    log.info("[INIT] All tasks started")
+    log.info("[INIT] All tasks running")
 
 # =========================================================
 # HEALTH SERVER
@@ -665,7 +812,7 @@ class HealthHandler(BaseHTTPRequestHandler):
 def run_health_server() -> None:
     port = int(os.getenv("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    log.info(f"[HEALTH] Server on port {port}")
+    log.info(f"[HEALTH] Listening on port {port}")
     server.serve_forever()
 
 # =========================================================
@@ -687,13 +834,11 @@ def main() -> None:
     app.add_handler(CommandHandler("calls",   cmd_calls))
     app.add_handler(CommandHandler("filters", cmd_filters))
     app.add_handler(CommandHandler("analyze", cmd_analyze))
-
-    # catch any plain text message that looks like a CA
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_ca_message))
 
     app.post_init = post_init
 
-    log.info("[MAIN] GemStalker starting...")
+    log.info("[MAIN] GemStalker starting")
     app.run_polling(drop_pending_updates=True)
 
 

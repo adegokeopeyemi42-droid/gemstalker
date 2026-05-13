@@ -23,15 +23,15 @@ PUMP_WS   = "wss://pumpportal.fun/api/data"
 SOL_PRICE = 150
 
 # =========================================================
-# FILTERS
+# FILTERS (relaxed so you actually get alerts)
 # =========================================================
 
-MC_MIN           = 5_000
-MC_MAX           = 50_000
-MIN_SOL_IN       = 6
-MIN_HOLDERS      = 20
-MIN_BUYS_PER_MIN = 10
-MAX_TOP_HOLDER   = 20
+MC_MIN           = 5_000   # min market cap USD
+MC_MAX           = 100_000 # max market cap USD
+MIN_SOL_IN       = 2       # min SOL bought in total
+MIN_HOLDERS      = 10      # min unique holders
+MIN_BUYS_PER_MIN = 3       # min buys per minute
+MAX_TOP_HOLDER   = 30      # max % held by top wallet
 
 # =========================================================
 # LOGGING
@@ -75,6 +75,9 @@ class Token:
 
 
 tokens: dict = {}
+
+# keeps last 20 alerted tokens for /calls
+recent_calls: deque = deque(maxlen=20)
 
 # =========================================================
 # HELPERS
@@ -139,19 +142,18 @@ def build_alert(t: Token) -> str:
     return (
         "🚨 EARLY GEM DETECTED 🚨\n\n"
         f"🪙 Token: {t.name} ({t.symbol})\n\n"
-        f"💰 Market Cap: ${fmt(t.market_cap)}\n"
-        f"💧 Liquidity: {t.sol_in:.2f} SOL\n"
-        f"📊 Volume: {total_volume:.2f} SOL\n"
-        f"👥 Holders: {t.holders}\n"
-        f"📈 Buy Pressure: {pressure}%\n"
-        f"⚡ Buys/Sells: {t.buy_count} / {t.sell_count}\n"
-        f"🏆 Top Holder: {t.top_holder:.1f}%\n"
-        f"🚀 Status: {migration}\n"
-        f"🔥 Alpha Score: {score}/10\n\n"
+        f"💰 Market Cap:    ${fmt(t.market_cap)}\n"
+        f"💧 Liquidity:     {t.sol_in:.2f} SOL\n"
+        f"📊 Volume:        {total_volume:.2f} SOL\n"
+        f"👥 Holders:       {t.holders}\n"
+        f"📈 Buy Pressure:  {pressure}%\n"
+        f"⚡ Buys/Sells:    {t.buy_count} / {t.sell_count}\n"
+        f"🏆 Top Holder:    {t.top_holder:.1f}%\n"
+        f"🚀 Status:        {migration}\n"
+        f"🔥 Alpha Score:   {score}/10\n\n"
         "━━━━━━━━━━━━━━━\n"
         f"📍 Contract:\n{t.mint}\n"
-        "━━━━━━━━━━━━━━━\n\n"
-        "🔗 Links: Photon | BullX | Dex"
+        "━━━━━━━━━━━━━━━"
     )
 
 # =========================================================
@@ -180,6 +182,15 @@ async def send_alert(app: Application, t: Token) -> None:
             disable_web_page_preview=True,
             reply_markup=keyboard,
         )
+        # save to recent calls
+        recent_calls.append({
+            "name":       t.name,
+            "symbol":     t.symbol,
+            "mint":       t.mint,
+            "market_cap": t.market_cap,
+            "score":      alpha_score(t),
+            "time":       time.time(),
+        })
     except Exception as e:
         log.error(f"Failed to send alert: {e}")
 
@@ -192,20 +203,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "👋 GemStalker is live!\n\n"
         "Scanning pump.fun in real-time.\n"
         "You will be alerted here when a gem passes the filters.\n\n"
-        "Current Filters:\n"
-        f"  Market Cap:     ${fmt(MC_MIN)} - ${fmt(MC_MAX)}\n"
-        f"  Min SOL In:     {MIN_SOL_IN} SOL\n"
-        f"  Min Holders:    {MIN_HOLDERS}\n"
-        f"  Min Buys/Min:   {MIN_BUYS_PER_MIN}\n"
-        f"  Max Top Holder: {MAX_TOP_HOLDER}%\n\n"
-        "Use /status to see live tracking stats."
+        "Commands:\n"
+        "  /start   - Show this message\n"
+        "  /status  - Live tracking stats\n"
+        "  /calls   - Last 5 gems alerted\n"
+        "  /filters - Show current filters\n\n"
+        "Use /filters to see what tokens pass."
     )
     await update.message.reply_text(msg)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    total   = len(tokens)
-    alerted = sum(1 for t in tokens.values() if t.called)
+    total    = len(tokens)
+    alerted  = sum(1 for t in tokens.values() if t.called)
     watching = total - alerted
 
     msg = (
@@ -214,6 +224,40 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"  Alerts sent:     {alerted}\n"
         f"  Still watching:  {watching}\n"
         f"  SOL Price used:  ${SOL_PRICE}"
+    )
+    await update.message.reply_text(msg)
+
+
+async def cmd_calls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not recent_calls:
+        await update.message.reply_text(
+            "No calls yet. Watching the market...\n"
+            "Try /status to see how many tokens are being tracked."
+        )
+        return
+
+    lines = ["🔥 Recent Calls (last 20):\n"]
+    for i, c in enumerate(reversed(recent_calls), 1):
+        age_min = int((time.time() - c["time"]) / 60)
+        age_str = f"{age_min}m ago" if age_min < 60 else f"{age_min // 60}h ago"
+        lines.append(
+            f"{i}. {c['name']} ({c['symbol']})\n"
+            f"   MC: ${fmt(c['market_cap'])} | Score: {c['score']}/10 | {age_str}\n"
+            f"   {c['mint'][:20]}...\n"
+        )
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = (
+        "⚙️ Current Filters:\n\n"
+        f"  Market Cap:      ${fmt(MC_MIN)} - ${fmt(MC_MAX)}\n"
+        f"  Min SOL In:      {MIN_SOL_IN} SOL\n"
+        f"  Min Holders:     {MIN_HOLDERS}\n"
+        f"  Min Buys/Min:    {MIN_BUYS_PER_MIN}\n"
+        f"  Max Top Holder:  {MAX_TOP_HOLDER}%\n\n"
+        "Edit these values in the code and redeploy to change them."
     )
     await update.message.reply_text(msg)
 
@@ -339,8 +383,10 @@ def main() -> None:
 
     app = Application.builder().token(TG_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("status",  cmd_status))
+    app.add_handler(CommandHandler("calls",   cmd_calls))
+    app.add_handler(CommandHandler("filters", cmd_filters))
 
     app.post_init = post_init
 

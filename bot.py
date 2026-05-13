@@ -20,7 +20,7 @@ TG_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID   = os.getenv("CHAT_ID")
 
 PUMP_WS   = "wss://pumpportal.fun/api/data"
-SOL_PRICE = 150  # USD per SOL — update as needed
+SOL_PRICE = 150
 
 # =========================================================
 # FILTERS
@@ -133,25 +133,25 @@ def passes_filters(t: Token) -> bool:
 def build_alert(t: Token) -> str:
     pressure     = buy_pressure(t)
     total_volume = t.buy_volume + t.sell_volume
-    migration    = "🚀 Raydium" if t.migrated else "⏳ Bonding Curve"
+    migration    = "Raydium" if t.migrated else "Bonding Curve"
     score        = alpha_score(t)
 
     return (
-        "🚨 *EARLY GEM DETECTED* 🚨\n\n"
-        f"🪙 *Token:* {t.name} \\({t.symbol}\\)\n\n"
-        f"💰 *Market Cap:* ${fmt(t.market_cap)}\n"
-        f"💧 *Liquidity:* {t.sol_in:.2f} SOL\n"
-        f"📊 *Volume:* {total_volume:.2f} SOL\n"
-        f"👥 *Holders:* {t.holders}\n"
-        f"📈 *Buy Pressure:* {pressure}%\n"
-        f"⚡ *Buys/Sells:* {t.buy_count} / {t.sell_count}\n"
-        f"🏆 *Top Holder:* {t.top_holder:.1f}%\n"
-        f"🚀 *Status:* {migration}\n"
-        f"🔥 *Alpha Score:* {score}/10\n\n"
+        "🚨 EARLY GEM DETECTED 🚨\n\n"
+        f"🪙 Token: {t.name} ({t.symbol})\n\n"
+        f"💰 Market Cap: ${fmt(t.market_cap)}\n"
+        f"💧 Liquidity: {t.sol_in:.2f} SOL\n"
+        f"📊 Volume: {total_volume:.2f} SOL\n"
+        f"👥 Holders: {t.holders}\n"
+        f"📈 Buy Pressure: {pressure}%\n"
+        f"⚡ Buys/Sells: {t.buy_count} / {t.sell_count}\n"
+        f"🏆 Top Holder: {t.top_holder:.1f}%\n"
+        f"🚀 Status: {migration}\n"
+        f"🔥 Alpha Score: {score}/10\n\n"
         "━━━━━━━━━━━━━━━\n"
-        f"📍 *Contract:*\n`{t.mint}`\n"
+        f"📍 Contract:\n{t.mint}\n"
         "━━━━━━━━━━━━━━━\n\n"
-        "🔗 *Links:* Photon • BullX • Dex"
+        "🔗 Links: Photon | BullX | Dex"
     )
 
 # =========================================================
@@ -177,7 +177,6 @@ async def send_alert(app: Application, t: Token) -> None:
         await app.bot.send_message(
             chat_id=CHAT_ID,
             text=build_alert(t),
-            parse_mode="MarkdownV2",
             disable_web_page_preview=True,
             reply_markup=keyboard,
         )
@@ -189,33 +188,34 @@ async def send_alert(app: Application, t: Token) -> None:
 # =========================================================
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "👋 *GemStalker is live\\!*\n\n"
-        "I'm scanning pump\\.fun in real\\-time and will alert you here when a gem passes the filters\\.\n\n"
-        "*Current Filters:*\n"
-        f"• Market Cap: ${fmt(MC_MIN)} — ${fmt(MC_MAX)}\n"
-        f"• Min SOL In: {MIN_SOL_IN} SOL\n"
-        f"• Min Holders: {MIN_HOLDERS}\n"
-        f"• Min Buys/Min: {MIN_BUYS_PER_MIN}\n"
-        f"• Max Top Holder: {MAX_TOP_HOLDER}%\n\n"
-        "Use /status to see how many tokens are being tracked\\.",
-        parse_mode="MarkdownV2",
+    msg = (
+        "👋 GemStalker is live!\n\n"
+        "Scanning pump.fun in real-time.\n"
+        "You will be alerted here when a gem passes the filters.\n\n"
+        "Current Filters:\n"
+        f"  Market Cap:     ${fmt(MC_MIN)} - ${fmt(MC_MAX)}\n"
+        f"  Min SOL In:     {MIN_SOL_IN} SOL\n"
+        f"  Min Holders:    {MIN_HOLDERS}\n"
+        f"  Min Buys/Min:   {MIN_BUYS_PER_MIN}\n"
+        f"  Max Top Holder: {MAX_TOP_HOLDER}%\n\n"
+        "Use /status to see live tracking stats."
     )
+    await update.message.reply_text(msg)
 
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    total    = len(tokens)
-    alerted  = sum(1 for t in tokens.values() if t.called)
-    tracking = total - alerted
+    total   = len(tokens)
+    alerted = sum(1 for t in tokens.values() if t.called)
+    watching = total - alerted
 
-    await update.message.reply_text(
-        f"📡 *GemStalker Status*\n\n"
-        f"• Tokens tracked: {total}\n"
-        f"• Alerts sent: {alerted}\n"
-        f"• Still watching: {tracking}\n"
-        f"• SOL Price used: ${SOL_PRICE}",
-        parse_mode="Markdown",
+    msg = (
+        "📡 GemStalker Status\n\n"
+        f"  Tokens tracked:  {total}\n"
+        f"  Alerts sent:     {alerted}\n"
+        f"  Still watching:  {watching}\n"
+        f"  SOL Price used:  ${SOL_PRICE}"
     )
+    await update.message.reply_text(msg)
 
 # =========================================================
 # EVENT HANDLER
@@ -239,7 +239,6 @@ async def handle_event(app: Application, msg: dict) -> None:
     market_cap_sol = float(msg.get("marketCapSol", 0) or 0)
     t.market_cap   = market_cap_sol * SOL_PRICE
 
-    # pump.fun sends solAmount already in SOL (not lamports)
     sol_amount = float(msg.get("solAmount", 0) or 0)
 
     if tx_type == "buy":
@@ -282,7 +281,7 @@ async def websocket_loop(app: Application) -> None:
                 ping_interval=20,
                 ping_timeout=20,
             ) as ws:
-                log.info("✅ Connected to pump.fun WebSocket")
+                log.info("Connected to pump.fun WebSocket")
 
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
                 await ws.send(json.dumps({"method": "subscribeTokenTrade"}))
@@ -307,7 +306,7 @@ async def post_init(app: Application) -> None:
     asyncio.create_task(websocket_loop(app))
 
 # =========================================================
-# HEALTH SERVER (keeps Render Web Service happy)
+# HEALTH SERVER
 # =========================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -317,7 +316,7 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
-        pass  # silence HTTP logs
+        pass
 
 
 def run_health_server() -> None:
@@ -336,18 +335,16 @@ def main() -> None:
     if not CHAT_ID:
         raise RuntimeError("CHAT_ID env var is not set")
 
-    # Keep Render happy with an open port
     threading.Thread(target=run_health_server, daemon=True).start()
 
     app = Application.builder().token(TG_TOKEN).build()
 
-    # Register command handlers
     app.add_handler(CommandHandler("start",  cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
 
     app.post_init = post_init
 
-    log.info("🚀 GemStalker started")
+    log.info("GemStalker started")
     app.run_polling(drop_pending_updates=True)
 
 

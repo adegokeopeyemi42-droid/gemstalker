@@ -9,18 +9,18 @@ from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import websockets
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application
+from telegram import InlineKeyboardMarkup, InlineKeyboardButton, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # =========================================================
 # CONFIG
 # =========================================================
 
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID  = os.getenv("CHAT_ID")
+TG_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID   = os.getenv("CHAT_ID")
 
 PUMP_WS   = "wss://pumpportal.fun/api/data"
-SOL_PRICE = 150  # USD per SOL (update as needed)
+SOL_PRICE = 150  # USD per SOL — update as needed
 
 # =========================================================
 # FILTERS
@@ -41,7 +41,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
-log = logging.getLogger(__name__)  # FIX: was **name** (broken dunder)
+log = logging.getLogger(__name__)
 
 # =========================================================
 # DATA MODEL
@@ -51,16 +51,15 @@ log = logging.getLogger(__name__)  # FIX: was **name** (broken dunder)
 class Token:
     mint: str
 
-    name:   str   = "Unknown"
-    symbol: str   = "?"
+    name:   str = "Unknown"
+    symbol: str = "?"
 
-    market_cap:  float = 0.0
-    sol_in:      float = 0.0
-
-    holders:     int   = 0
-    top_holder:  float = 0.0
-
+    market_cap:    float = 0.0
+    sol_in:        float = 0.0
     bonding_curve: float = 0.0
+
+    holders:    int   = 0
+    top_holder: float = 0.0
 
     buy_count:  int = 0
     sell_count: int = 0
@@ -75,13 +74,13 @@ class Token:
     buys: deque = field(default_factory=lambda: deque(maxlen=300))
 
 
-tokens: dict[str, Token] = {}
+tokens: dict = {}
 
 # =========================================================
 # HELPERS
 # =========================================================
 
-def fmt(n: float) -> str:
+def fmt(n) -> str:
     n = float(n)
     if n >= 1_000_000:
         return f"{n / 1_000_000:.2f}M"
@@ -137,10 +136,9 @@ def build_alert(t: Token) -> str:
     migration    = "🚀 Raydium" if t.migrated else "⏳ Bonding Curve"
     score        = alpha_score(t)
 
-    # FIX: triple-quote string was malformed in original
     return (
         "🚨 *EARLY GEM DETECTED* 🚨\n\n"
-        f"🪙 *Token:* {t.name} ({t.symbol})\n\n"
+        f"🪙 *Token:* {t.name} \\({t.symbol}\\)\n\n"
         f"💰 *Market Cap:* ${fmt(t.market_cap)}\n"
         f"💧 *Liquidity:* {t.sol_in:.2f} SOL\n"
         f"📊 *Volume:* {total_volume:.2f} SOL\n"
@@ -167,20 +165,56 @@ async def send_alert(app: Application, t: Token) -> None:
 
     keyboard = InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("Photon", url=photon),
-            InlineKeyboardButton("BullX",  url=bullx),
+            InlineKeyboardButton("⚡ Photon", url=photon),
+            InlineKeyboardButton("🐂 BullX",  url=bullx),
         ],
         [
-            InlineKeyboardButton("Dex", url=dex),
+            InlineKeyboardButton("📊 DexScreener", url=dex),
         ],
     ])
 
-    await app.bot.send_message(
-        chat_id=CHAT_ID,
-        text=build_alert(t),
+    try:
+        await app.bot.send_message(
+            chat_id=CHAT_ID,
+            text=build_alert(t),
+            parse_mode="MarkdownV2",
+            disable_web_page_preview=True,
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        log.error(f"Failed to send alert: {e}")
+
+# =========================================================
+# COMMAND HANDLERS
+# =========================================================
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "👋 *GemStalker is live\\!*\n\n"
+        "I'm scanning pump\\.fun in real\\-time and will alert you here when a gem passes the filters\\.\n\n"
+        "*Current Filters:*\n"
+        f"• Market Cap: ${fmt(MC_MIN)} — ${fmt(MC_MAX)}\n"
+        f"• Min SOL In: {MIN_SOL_IN} SOL\n"
+        f"• Min Holders: {MIN_HOLDERS}\n"
+        f"• Min Buys/Min: {MIN_BUYS_PER_MIN}\n"
+        f"• Max Top Holder: {MAX_TOP_HOLDER}%\n\n"
+        "Use /status to see how many tokens are being tracked\\.",
+        parse_mode="MarkdownV2",
+    )
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    total    = len(tokens)
+    alerted  = sum(1 for t in tokens.values() if t.called)
+    tracking = total - alerted
+
+    await update.message.reply_text(
+        f"📡 *GemStalker Status*\n\n"
+        f"• Tokens tracked: {total}\n"
+        f"• Alerts sent: {alerted}\n"
+        f"• Still watching: {tracking}\n"
+        f"• SOL Price used: ${SOL_PRICE}",
         parse_mode="Markdown",
-        disable_web_page_preview=True,
-        reply_markup=keyboard,
     )
 
 # =========================================================
@@ -199,20 +233,15 @@ async def handle_event(app: Application, msg: dict) -> None:
 
     t = tokens[mint]
 
-    # Update name/symbol if provided
     t.name   = msg.get("name",   t.name)
     t.symbol = msg.get("symbol", t.symbol)
 
-    # Market cap
-    market_cap_sol = float(msg.get("marketCapSol", 0))
+    market_cap_sol = float(msg.get("marketCapSol", 0) or 0)
     t.market_cap   = market_cap_sol * SOL_PRICE
 
-    # FIX: pump.fun sends solAmount already in SOL (not lamports).
-    # Original code divided by 1_000_000_000, producing near-zero values
-    # and silently breaking the MIN_SOL_IN filter.
-    sol_amount = float(msg.get("solAmount", 0))
+    # pump.fun sends solAmount already in SOL (not lamports)
+    sol_amount = float(msg.get("solAmount", 0) or 0)
 
-    # ----------------------------------------------------------
     if tx_type == "buy":
         t.buy_count  += 1
         t.buy_volume += sol_amount
@@ -222,26 +251,20 @@ async def handle_event(app: Application, msg: dict) -> None:
     elif tx_type == "sell":
         t.sell_count  += 1
         t.sell_volume += sol_amount
-    # ----------------------------------------------------------
 
-    # Bonding curve progress
-    t.bonding_curve = float(msg.get("bondingCurveProgress", 0))
+    t.bonding_curve = float(msg.get("bondingCurveProgress", 0) or 0)
 
-    # Migration flag
     if msg.get("raydiumPool"):
         t.migrated = True
 
-    # Holders — safe default to avoid overwriting a higher value with 0
-    holder_count = int(msg.get("holderCount", 0))
+    holder_count = int(msg.get("holderCount", 0) or 0)
     if holder_count:
         t.holders = max(t.holders, holder_count)
 
-    # Top holder percentage (not always present in trade events)
-    top_holder = float(msg.get("topHolder", 0))
+    top_holder = float(msg.get("topHolder", 0) or 0)
     if top_holder:
         t.top_holder = top_holder
 
-    # Fire alert once when all filters pass
     if not t.called and passes_filters(t):
         t.called = True
         log.info(f"ALERT -> {t.name} ({t.symbol}) | MC=${fmt(t.market_cap)}")
@@ -259,7 +282,7 @@ async def websocket_loop(app: Application) -> None:
                 ping_interval=20,
                 ping_timeout=20,
             ) as ws:
-                log.info("Connected to pump.fun WebSocket")
+                log.info("✅ Connected to pump.fun WebSocket")
 
                 await ws.send(json.dumps({"method": "subscribeNewToken"}))
                 await ws.send(json.dumps({"method": "subscribeTokenTrade"}))
@@ -269,10 +292,10 @@ async def websocket_loop(app: Application) -> None:
                         msg = json.loads(raw)
                         await handle_event(app, msg)
                     except Exception as e:
-                        log.error(f"Event handling error: {e}")
+                        log.error(f"Event error: {e}")
 
         except Exception as e:
-            log.error(f"WebSocket disconnected: {e} — reconnecting in 5s")
+            log.error(f"WebSocket dropped: {e} — reconnecting in 5s")
             await asyncio.sleep(5)
 
 # =========================================================
@@ -280,6 +303,7 @@ async def websocket_loop(app: Application) -> None:
 # =========================================================
 
 async def post_init(app: Application) -> None:
+    log.info("Starting WebSocket listener...")
     asyncio.create_task(websocket_loop(app))
 
 # =========================================================
@@ -293,17 +317,17 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
-        pass  # silence HTTP logs from flooding the console
+        pass  # silence HTTP logs
 
 
 def run_health_server() -> None:
     port = int(os.getenv("PORT", 8080))
     server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    log.info(f"Health server listening on port {port}")
+    log.info(f"Health server on port {port}")
     server.serve_forever()
 
 # =========================================================
-# ENTRY POINT
+# MAIN
 # =========================================================
 
 def main() -> None:
@@ -312,15 +336,20 @@ def main() -> None:
     if not CHAT_ID:
         raise RuntimeError("CHAT_ID env var is not set")
 
-    # Start health server in background so Render detects an open port
+    # Keep Render happy with an open port
     threading.Thread(target=run_health_server, daemon=True).start()
 
     app = Application.builder().token(TG_TOKEN).build()
+
+    # Register command handlers
+    app.add_handler(CommandHandler("start",  cmd_start))
+    app.add_handler(CommandHandler("status", cmd_status))
+
     app.post_init = post_init
 
-    log.info("GemStalker started")
+    log.info("🚀 GemStalker started")
     app.run_polling(drop_pending_updates=True)
 
 
-if __name__ == "__main__":  # FIX: was **name** == "**main**" (broken dunders)
+if __name__ == "__main__":
     main()

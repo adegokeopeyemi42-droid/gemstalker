@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from collections import deque
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
+import httpx
 import websockets
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton, Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -20,18 +21,20 @@ TG_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID   = os.getenv("CHAT_ID")
 
 PUMP_WS   = "wss://pumpportal.fun/api/data"
-SOL_PRICE = 150
+
+# SOL price — updated every 60s from CoinGecko (free, no key needed)
+SOL_PRICE = 95.0
 
 # =========================================================
-# FILTERS (relaxed so you actually get alerts)
+# FILTERS
 # =========================================================
 
-MC_MIN           = 5_000   # min market cap USD
-MC_MAX           = 100_000 # max market cap USD
-MIN_SOL_IN       = 2       # min SOL bought in total
-MIN_HOLDERS      = 10      # min unique holders
-MIN_BUYS_PER_MIN = 3       # min buys per minute
-MAX_TOP_HOLDER   = 30      # max % held by top wallet
+MC_MIN           = 5_000
+MC_MAX           = 100_000
+MIN_SOL_IN       = 2
+MIN_HOLDERS      = 10
+MIN_BUYS_PER_MIN = 3
+MAX_TOP_HOLDER   = 30
 
 # =========================================================
 # LOGGING
@@ -75,9 +78,28 @@ class Token:
 
 
 tokens: dict = {}
-
-# keeps last 20 alerted tokens for /calls
 recent_calls: deque = deque(maxlen=20)
+
+# =========================================================
+# LIVE SOL PRICE
+# =========================================================
+
+async def update_sol_price() -> None:
+    global SOL_PRICE
+    url = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd"
+
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(url)
+                data = r.json()
+                price = data["solana"]["usd"]
+                SOL_PRICE = float(price)
+                log.info(f"SOL price updated: ${SOL_PRICE}")
+        except Exception as e:
+            log.warning(f"SOL price fetch failed: {e} — keeping ${SOL_PRICE}")
+
+        await asyncio.sleep(60)  # refresh every 60 seconds
 
 # =========================================================
 # HELPERS
@@ -151,6 +173,7 @@ def build_alert(t: Token) -> str:
         f"🏆 Top Holder:    {t.top_holder:.1f}%\n"
         f"🚀 Status:        {migration}\n"
         f"🔥 Alpha Score:   {score}/10\n\n"
+        f"💵 SOL Price:     ${SOL_PRICE:.2f}\n\n"
         "━━━━━━━━━━━━━━━\n"
         f"📍 Contract:\n{t.mint}\n"
         "━━━━━━━━━━━━━━━"
@@ -182,7 +205,6 @@ async def send_alert(app: Application, t: Token) -> None:
             disable_web_page_preview=True,
             reply_markup=keyboard,
         )
-        # save to recent calls
         recent_calls.append({
             "name":       t.name,
             "symbol":     t.symbol,
@@ -206,7 +228,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Commands:\n"
         "  /start   - Show this message\n"
         "  /status  - Live tracking stats\n"
-        "  /calls   - Last 5 gems alerted\n"
+        "  /calls   - Last 20 gems alerted\n"
         "  /filters - Show current filters\n\n"
         "Use /filters to see what tokens pass."
     )
@@ -223,7 +245,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"  Tokens tracked:  {total}\n"
         f"  Alerts sent:     {alerted}\n"
         f"  Still watching:  {watching}\n"
-        f"  SOL Price used:  ${SOL_PRICE}"
+        f"  SOL Price:       ${SOL_PRICE:.2f} (live)"
     )
     await update.message.reply_text(msg)
 
@@ -232,11 +254,11 @@ async def cmd_calls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not recent_calls:
         await update.message.reply_text(
             "No calls yet. Watching the market...\n"
-            "Try /status to see how many tokens are being tracked."
+            "Use /status to see how many tokens are being tracked."
         )
         return
 
-    lines = ["🔥 Recent Calls (last 20):\n"]
+    lines = ["🔥 Recent Calls:\n"]
     for i, c in enumerate(reversed(recent_calls), 1):
         age_min = int((time.time() - c["time"]) / 60)
         age_str = f"{age_min}m ago" if age_min < 60 else f"{age_min // 60}h ago"
@@ -257,7 +279,8 @@ async def cmd_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f"  Min Holders:     {MIN_HOLDERS}\n"
         f"  Min Buys/Min:    {MIN_BUYS_PER_MIN}\n"
         f"  Max Top Holder:  {MAX_TOP_HOLDER}%\n\n"
-        "Edit these values in the code and redeploy to change them."
+        f"  SOL Price:       ${SOL_PRICE:.2f} (live)\n\n"
+        "Edit values in the code and redeploy to change them."
     )
     await update.message.reply_text(msg)
 
@@ -347,6 +370,7 @@ async def websocket_loop(app: Application) -> None:
 
 async def post_init(app: Application) -> None:
     log.info("Starting WebSocket listener...")
+    asyncio.create_task(update_sol_price())
     asyncio.create_task(websocket_loop(app))
 
 # =========================================================

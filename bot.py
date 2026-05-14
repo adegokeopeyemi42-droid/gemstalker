@@ -832,3 +832,293 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+# =========================================================
+# CONFIG - ADD THESE
+# =========================================================
+PUMPPORTAL_KEY = os.getenv('PUMPPORTAL_API_KEY', '')  # Optional but recommended
+PUMPPORTAL_WS = 'wss://pumpportal.fun/api/data'
+
+# Track which tokens we're subscribed to
+subscribed_tokens: set = set()
+max_subscriptions = 500  # PumpPortal practical limit per connection
+
+# =========================================================
+# EVENT VALIDATION & NORMALIZATION
+# =========================================================
+def validate_and_normalize_event(raw_msg: dict) -> tuple[bool, dict | None]:
+    """
+    Validates incoming websocket event against expected schema.
+    Returns (is_valid, normalized_event).
+    Normalized event has consistent field types and scaling.
+    """
+    # Must have these minimal fields
+    if not raw_msg.get('mint'):
+        return False, None
+    
+    tx_type = (raw_msg.get('txType') or '').lower()
+    if tx_type not in ('buy', 'sell', 'create', 'new', 'mint'):
+        # Unknown tx type — may be valid but log for audit
+        if tx_type:
+            log.debug(f'Unknown txType: {tx_type}')
+        return False, None
+    
+    normalized = {
+        'mint': raw_msg['mint'].strip(),
+        'txType': 'buy' if tx_type == 'buy' else 'sell' if tx_type == 'sell' else 'create',
+        'name': (raw_msg.get('name') or 'Unknown').strip()[:100],
+        'symbol': (raw_msg.get('symbol') or '?').strip()[:20],
+        'solAmount': max(float(raw_msg.get('solAmount') or 0), 0),
+        'marketCapSol': max(float(raw_msg.get('marketCapSol') or 0), 0),
+        'virtualSolReserves': max(float(raw_msg.get('virtualSolReserves') or 0), 0) / 1e9,
+        'bondingCurveProgress': float(raw_msg.get('bondingCurveProgress') or 0),
+        'raydiumPool': raw_msg.get('raydiumPool') or '',
+        'twitter': (raw_msg.get('twitter') or '').strip(),
+        'telegram': (raw_msg.get('telegram') or '').strip(),
+        'website': (raw_msg.get('website') or '').strip(),
+    }
+    
+    # Validate bonding curve scale: if > 1, assume it's 0-100 and normalize to 0-1
+    if normalized['bondingCurveProgress'] > 1:
+        normalized['bondingCurveProgress'] = min(normalized['bondingCurveProgress'] / 100, 1.0)
+    
+    return True, normalized
+
+# =========================================================
+# WEBSOCKET LOOP - REFACTORED
+# =========================================================
+async def websocket_loop(app: Application) -> None:
+    """
+    Enhanced websocket handler with:
+    - API key support
+    - Per-token subscription (not global)
+    - Event validation
+    - Robust error handling & logging
+    """
+    retries = 0
+    connection_uri = PUMPPORTAL_WS
+    if PUMPPORTAL_KEY:
+        connection_uri += f'?api-key={PUMPPORTAL_KEY}'
+    
+    while True:
+        try:
+            log.info(f'WS connecting (attempt {retries+1}) to {PUMPPORTAL_WS}')
+            async with websockets.connect(
+                connection_uri,
+                ping_interval=20,
+                ping_timeout=30,
+                close_timeout=10,
+            ) as ws:
+                retries = 0
+                log.info('WS connected to pumpportal.fun')
+                
+                # Subscribe to new token announcements (global)
+                await ws.send(json.dumps({'method': 'subscribeNewToken'}))
+                log.info('WS subscription sent: subscribeNewToken')
+                
+                # Note: subscribeTokenTrade is per-token; we'll send it dynamically
+                # as we discover new tokens via subscribeNewToken
+                
+                hb = time.time()
+                event_validation_stats = {
+                    'received': 0, 'valid': 0, 'invalid': 0,
+                    'by_type': {}
+                }
+                
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                        
+                        # VALIDATION STEP 1: Reject null/empty
+                        if not msg:
+                            event_validation_stats['invalid'] += 1
+                            continue
+                        
+                        event_validation_stats['received'] += 1
+                        tx_type = msg.get('txType', 'unknown')
+                        event_validation_stats['by_type'][tx_type] = \
+                            event_validation_stats['by_type'].get(tx_type, 0) + 1
+                        
+                        # VALIDATION STEP 2: Normalize & validate
+                        is_valid, normalized = validate_and_normalize_event(msg)
+                        if not is_valid:
+                            event_validation_stats['invalid'] += 1
+                            continue
+                        
+                        event_validation_stats['valid'] += 1
+                        
+                        # Sample logging for first few events of each type (audit trail)
+                        if event_validation_stats['by_type'].get(normalized['txType'], 0) <= 3:
+                            log.debug(
+                                f'[WS EVENT SAMPLE] txType={normalized["txType"]} '
+                                f'mint={normalized["mint"][:12]} '
+                                f'solAmount={normalized["solAmount"]:.2f} '
+                                f'marketCapSol={normalized["marketCapSol"]:.2f} '
+                                f'bcProgress={normalized["bondingCurveProgress"]:.2f}'
+                            )
+                        
+                        # NEW TOKEN SUBSCRIPTION
+                        # If this is a new token (create/mint), subscribe to its trades
+                        if normalized['txType'] == 'create':
+                            mint = normalized['mint']
+                            if mint not in subscribed_tokens and len(subscribed_tokens) < max_subscriptions:
+                                try:
+                                    await ws.send(json.dumps({
+                                        'method': 'subscribeTokenTrade',
+                                        'keys': [mint]
+                                    }))
+                                    subscribed_tokens.add(mint)
+                                    log.info(
+                                        f'New token subscription: {normalized["name"]} ({normalized["symbol"]}) | '
+                                        f'mint={mint[:12]} | '
+                                        f'total_subscribed={len(subscribed_tokens)}'
+                                    )
+                                except Exception as e:
+                                    log.error(f'Failed to subscribe to token {mint}: {e}')
+                        
+                        # HANDLE EVENT
+                        await handle_event(app, normalized)
+                        
+                        # Heartbeat every 60s
+                        if time.time() - hb > 60:
+                            hb = time.time()
+                            alerted = sum(1 for t in tokens.values() if t.called)
+                            log.info(
+                                f'WS alive | '
+                                f'tokens_tracked={len(tokens)} '
+                                f'alerts_sent={alerted} '
+                                f'subscribed_to={len(subscribed_tokens)} '
+                                f'events_validation: '
+                                f'received={event_validation_stats["received"]} '
+                                f'valid={event_validation_stats["valid"]} '
+                                f'invalid={event_validation_stats["invalid"]} | '
+                                f'event_types={dict(list(event_validation_stats["by_type"].items())[:8])}'
+                            )
+                            event_validation_stats = {
+                                'received': 0, 'valid': 0, 'invalid': 0,
+                                'by_type': {}
+                            }
+                    
+                    except json.JSONDecodeError as e:
+                        log.warning(f'JSON decode error: {e} | raw={raw[:100]}')
+                    except Exception as e:
+                        log.error(f'Event handling error: {e}', exc_info=False)
+        
+        except Exception as e:
+            retries += 1
+            wait = min(5 * retries, 60)
+            log.error(f'WS disconnected: {e} — retrying in {wait}s (attempt {retries})')
+            await asyncio.sleep(wait)
+
+# =========================================================
+# UPDATE handle_event() TO USE NORMALIZED DATA
+# =========================================================
+async def handle_event(app: Application, normalized: dict) -> None:
+    """
+    Updated to accept pre-validated, normalized event.
+    All fields are guaranteed to exist and be correct type/scale.
+    """
+    global ev_count, buy_count_global
+    
+    tx_type = normalized['txType']
+    mint = normalized['mint']
+    ev_count += 1
+    
+    if mint not in tokens:
+        tokens[mint] = Token(mint=mint)
+    
+    t = tokens[mint]
+    t.last_active = time.time()
+    t.name = normalized['name'] or t.name
+    t.symbol = normalized['symbol'] or t.symbol
+    
+    # Market cap: convert from SOL to USD
+    if normalized['marketCapSol'] > 0:
+        t.market_cap = normalized['marketCapSol'] * SOL_PRICE
+    
+    # Virtual reserves (optional, for reference only)
+    if normalized['virtualSolReserves'] > 0:
+        t.virtual_sol = normalized['virtualSolReserves']
+    
+    # Bonding curve: now guaranteed to be 0–1 range
+    t.bonding_curve = min(normalized['bondingCurveProgress'] * 100, 100)  # Convert back to 0–100 for display
+    
+    sol_amt = normalized['solAmount']
+    
+    if tx_type == 'buy':
+        buy_count_global += 1
+        t.buy_count += 1
+        t.sol_in += sol_amt
+        t.buys_ts.append(time.time())
+        log.debug(f'BUY: {t.name} | +{sol_amt:.2f} SOL | total_in={t.sol_in:.2f}')
+    elif tx_type == 'sell':
+        t.sell_count += 1
+        t.sol_out += sol_amt
+        log.debug(f'SELL: {t.name} | -{sol_amt:.2f} SOL | total_out={t.sol_out:.2f}')
+    
+    # Socials
+    for field_name, attr in [('twitter', 'twitter'), ('telegram', 'telegram_link'), ('website', 'website')]:
+        val = normalized.get(field_name, '')
+        if val and not getattr(t, attr):
+            setattr(t, attr, val)
+    
+    # Migration to Raydium
+    if normalized['raydiumPool'] and not t.migrated:
+        t.migrated = True
+        log.info(f'Migration detected: {t.name} ({t.symbol})')
+        asyncio.create_task(fetch_and_set_raydium_liq(t))
+    
+    # Already alerted — track milestones only
+    if t.called:
+        await check_milestones(app, t)
+        return
+    
+    # Score & filter
+    score, score_reasons = compute_score(t)
+    t.last_score = score
+    
+    ok, reason = passes(t)
+    if ok:
+        if not t.twitter and not t.telegram_link and not t.website:
+            asyncio.create_task(fetch_and_set_socials(app, t))
+        else:
+            asyncio.create_task(send_alert(app, t))
+    else:
+        # Detailed rejection logging (once per 10 buys to avoid spam)
+        if tx_type == 'buy' and t.buy_count % 10 == 0:
+            log.info(
+                f'SKIP: {t.name} ({t.symbol}) | '
+                f'Score={score}/{MIN_SCORE} | {reason} | '
+                f'MC={fmt(t.market_cap)} | NetSOL={net_sol(t):.2f} | '
+                f'Buys={t.buy_count} | Pressure={pressure(t)}% | BPM={bpm(t):.1f}'
+            )
+
+# =========================================================
+# UPDATE main() TO SET API KEY
+# =========================================================
+def main() -> None:
+    if not TG_TOKEN: 
+        raise RuntimeError('TELEGRAM_BOT_TOKEN not set')
+    if not CHAT_ID: 
+        raise RuntimeError('CHAT_ID not set')
+    
+    # Warn if API key not provided (optional but recommended)
+    if not PUMPPORTAL_KEY:
+        log.warning(
+            'PUMPPORTAL_API_KEY not set. Connection may be rate-limited. '
+            'Set it for production use.'
+        )
+    
+    threading.Thread(target=run_health, daemon=True).start()
+    app = Application.builder().token(TG_TOKEN).build()
+    app.add_handler(CommandHandler('start', cmd_start))
+    app.add_handler(CommandHandler('status', cmd_status))
+    app.add_handler(CommandHandler('calls', cmd_calls))
+    app.add_handler(CommandHandler('filters', cmd_filters))
+    app.add_handler(CommandHandler('debug', cmd_debug))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.post_init = post_init
+    log.info('GemStalker starting with enhanced websocket validation')
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == '__main__':
+    main()    

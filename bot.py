@@ -18,6 +18,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 # =========================================================
 TG_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 CHAT_ID = os.getenv('CHAT_ID')
+PUMPPORTAL_KEY = os.getenv('PUMPPORTAL_API_KEY', '')   # Optional but recommended
 PUMP_WS = 'wss://pumpportal.fun/api/data'
 SOL_PRICE = 150.0
 SOLANA_CA_RE = re.compile(r'\b[1-9A-HJ-NP-Za-km-z]{32,44}\b')
@@ -25,19 +26,18 @@ SOLANA_CA_RE = re.compile(r'\b[1-9A-HJ-NP-Za-km-z]{32,44}\b')
 # =========================================================
 # FILTERS (pre-migration focused)
 # =========================================================
-MC_MIN = 5_000
-MC_MAX = 300_000
-# FIX 1: Lowered for live testing — tighten once alerts are confirmed working
-MIN_NET_SOL = 3.0       # was 6.0
-MIN_PRESSURE = 55       # was 65
-MIN_BPM = 2.0           # was 4.0
-MIN_BUYS = 3            # was 5
+MC_MIN          = 5_000
+MC_MAX          = 300_000
+MIN_POOL_SOL    = 10.0      # replaces MIN_NET_SOL — measures bonding curve depth (real liquidity)
+MIN_PRESSURE    = 55
+MIN_BPM         = 2.0
+MIN_BUYS        = 3
 MAX_AGE_MINUTES = 20
-BC_MIN = 15.0           # bonding curve % lower bound
-BC_MAX = 70.0           # bonding curve % upper bound
-MIN_SCORE = 40          # was 60
-ALERT_DELAY_SEC = 3     # brief pause before sending
-MILESTONES = [2, 5, 10, 25, 50, 100]
+BC_MIN          = 15.0      # bonding curve % lower bound
+BC_MAX          = 70.0      # bonding curve % upper bound
+MIN_SCORE       = 40
+ALERT_DELAY_SEC = 3
+MILESTONES      = [2, 5, 10, 25, 50, 100]
 
 # =========================================================
 # LOGGING
@@ -54,45 +54,59 @@ log = logging.getLogger(__name__)
 @dataclass
 class Token:
     mint: str
-    name: str = 'Unknown'
-    symbol: str = '?'
-    market_cap: float = 0.0
-    virtual_sol: float = 0.0
-    sol_in: float = 0.0
-    sol_out: float = 0.0
+    name: str          = 'Unknown'
+    symbol: str        = '?'
+    market_cap: float  = 0.0
+    virtual_sol: float = 0.0   # bonding curve SOL reserves (real pool depth) — already in SOL
+    sol_in: float      = 0.0   # cumulative buy volume in SOL  (display/volume only)
+    sol_out: float     = 0.0   # cumulative sell volume in SOL (display/volume only)
     bonding_curve: float = 0.0
-    buy_count: int = 0
-    sell_count: int = 0
-    migrated: bool = False
+    buy_count: int     = 0
+    sell_count: int    = 0
+    migrated: bool     = False
     raydium_liq: float = 0.0
-    called: bool = False
-    twitter: str = ''
+    called: bool       = False
+    twitter: str       = ''
     telegram_link: str = ''
-    website: str = ''
-    created_at: float = field(default_factory=time.time)
+    website: str       = ''
+    created_at: float  = field(default_factory=time.time)
     last_active: float = field(default_factory=time.time)
-    buys_ts: deque = field(default_factory=lambda: deque(maxlen=300))
-    entry_mc: float = 0.0
+    buys_ts: deque     = field(default_factory=lambda: deque(maxlen=300))
+    entry_mc: float    = 0.0
     next_milestone: int = 2
-    last_score: int = 0  # cached for debug logging
-    watchlist: bool = False  # stage-1 watchlist flag
+    last_score: int    = 0
+    watchlist: bool    = False
     watchlist_since: float = 0.0
 
-tokens: dict = {}
-recent_calls: deque = deque(maxlen=500)
-ev_count = 0
-buy_count_global = 0
-ws_event_counts: dict = {}  # track raw event types for debug
+tokens: dict           = {}
+recent_calls: deque    = deque(maxlen=500)
+ev_count               = 0
+buy_count_global       = 0
+ws_event_counts: dict  = {}
+subscribed_tokens: set = set()
+MAX_SUBSCRIPTIONS      = 500
 
 # =========================================================
-# LIQUIDITY HELPERS (pre-migration: use net retained SOL)
+# LIQUIDITY HELPERS
+# ---------------------------------------------------------
+# Pump.fun bonding curve seeds with ~30 SOL of virtual
+# reserves. virtualSolReserves (scaled to SOL in the event
+# handler) IS the pool depth — what Trojan / GMGN / Axiom
+# all display as "Liquidity".
+#
+# sol_in / sol_out are VOLUME accumulators, NOT liquidity.
+# They are kept only for the volume display line in alerts.
+#
+# Pre-migration  → pool_sol()  (bonding curve depth)
+# Post-migration → raydium_liq (fetched from DexScreener)
 # =========================================================
-def net_sol(t: Token) -> float:
-    return max(t.sol_in - t.sol_out, 0.0)
+def pool_sol(t: Token) -> float:
+    """SOL locked in the bonding curve — the real pool depth."""
+    return t.virtual_sol
 
 def effective_liq(t: Token) -> float:
-    """Primary pre-migration liquidity: SOL actually retained × price."""
-    return net_sol(t) * SOL_PRICE
+    """Pool depth in USD (what trading UIs show as Liquidity)."""
+    return pool_sol(t) * SOL_PRICE
 
 def get_liq(t: Token) -> float:
     if t.migrated and t.raydium_liq > 0:
@@ -102,7 +116,7 @@ def get_liq(t: Token) -> float:
 def liq_source(t: Token) -> str:
     if t.migrated and t.raydium_liq > 0:
         return 'Raydium'
-    return 'Net Retained'
+    return 'Bonding Curve'
 
 # =========================================================
 # SOL PRICE UPDATE
@@ -127,7 +141,7 @@ def fmt(n, dec=1) -> str:
     if n is None: return 'N/A'
     n = float(n)
     if n >= 1_000_000: return f'${n/1_000_000:.{dec}f}M'
-    if n >= 1_000: return f'${n/1_000:.{dec}f}K'
+    if n >= 1_000:     return f'${n/1_000:.{dec}f}K'
     return f'${n:.{dec}f}'
 
 def bpm(t: Token) -> float:
@@ -140,7 +154,7 @@ def pressure(t: Token) -> int:
 
 def age_str(t: Token) -> str:
     s = int(time.time() - t.created_at)
-    if s < 60: return f'{s}s'
+    if s < 60:   return f'{s}s'
     if s < 3600: return f'{s//60}m'
     return f'{s//3600}h{(s%3600)//60}m'
 
@@ -151,24 +165,21 @@ def age_min(t: Token) -> float:
 # SCORE-BASED FILTER
 # =========================================================
 def compute_score(t: Token) -> tuple[int, list[str]]:
-    """
-    Returns (score, [reason_strings]).
-    Positive signals add; negatives penalise.
-    """
-    score = 0
+    """Returns (score, [reason_strings])."""
+    score   = 0
     reasons = []
-    ns = net_sol(t)
-    p = pressure(t)
-    b = bpm(t)
+    ps = pool_sol(t)
+    p  = pressure(t)
+    b  = bpm(t)
     bc = t.bonding_curve
 
-    # --- net SOL retained ---
-    if ns >= 20:
-        score += 35; reasons.append(f'+35 net_sol>=20 ({ns:.1f})')
-    elif ns >= 10:
-        score += 25; reasons.append(f'+25 net_sol>=10 ({ns:.1f})')
-    elif ns >= 5:
-        score += 15; reasons.append(f'+15 net_sol>=5 ({ns:.1f})')
+    # --- pool depth (replaces net SOL) ---
+    if ps >= 50:
+        score += 35; reasons.append(f'+35 pool_sol>=50 ({ps:.1f})')
+    elif ps >= 30:
+        score += 25; reasons.append(f'+25 pool_sol>=30 ({ps:.1f})')
+    elif ps >= 15:
+        score += 15; reasons.append(f'+15 pool_sol>=15 ({ps:.1f})')
 
     # --- buy pressure ---
     if p >= 75:
@@ -182,7 +193,7 @@ def compute_score(t: Token) -> tuple[int, list[str]]:
     elif b >= 5:
         score += 10; reasons.append(f'+10 bpm>=5 ({b:.1f})')
 
-    # --- bonding curve in sweet spot ---
+    # --- bonding curve sweet spot ---
     if BC_MIN <= bc <= BC_MAX:
         score += 15; reasons.append(f'+15 bc={bc:.0f}%')
 
@@ -192,7 +203,7 @@ def compute_score(t: Token) -> tuple[int, list[str]]:
 
     # --- penalties ---
     if t.sell_count > t.buy_count:
-        score -= 25; reasons.append(f'-25 sells>buys')
+        score -= 25; reasons.append('-25 sells>buys')
     if b < 2:
         score -= 20; reasons.append(f'-20 bpm<2 ({b:.1f})')
 
@@ -206,24 +217,22 @@ def passes_hard(t: Token) -> tuple[bool, str]:
         return False, f'MC too low ({fmt(t.market_cap)})'
     if t.market_cap > MC_MAX:
         return False, f'MC too high ({fmt(t.market_cap)})'
-    ns = net_sol(t)
-    if ns < MIN_NET_SOL:
-        return False, f'Net SOL too low ({ns:.2f})'
+    ps = pool_sol(t)
+    if ps < MIN_POOL_SOL:
+        return False, f'Pool SOL too low ({ps:.2f} SOL)'
     if pressure(t) < MIN_PRESSURE:
         return False, f'Pressure too low ({pressure(t)}%)'
     if bpm(t) < MIN_BPM:
         return False, f'BPM too low ({bpm(t):.1f})'
     if t.buy_count < MIN_BUYS:
         return False, f'Not enough buys ({t.buy_count})'
-    if t.sol_in <= t.sol_out:
-        return False, 'Net negative flow'
     return True, 'OK'
 
 def passes(t: Token) -> tuple[bool, str]:
     ok, reason = passes_hard(t)
     if not ok:
         return False, reason
-    score, reasons = compute_score(t)
+    score, _ = compute_score(t)
     t.last_score = score
     if score < MIN_SCORE:
         return False, f'Score too low ({score}/{MIN_SCORE})'
@@ -237,18 +246,18 @@ def security_read(t: Token) -> list:
     reads = []
     p = pressure(t)
     b = bpm(t)
-    if p >= 70: reads.append('Strong buy pressure')
+    if p >= 70:   reads.append('Strong buy pressure')
     elif p >= 55: reads.append('Moderate buy pressure')
-    else: reads.append('Sell pressure present')
-    if liq >= 10_000: reads.append('Good liquidity')
+    else:         reads.append('Sell pressure present')
+    if liq >= 10_000:  reads.append('Good liquidity')
     elif liq >= 4_000: reads.append('Decent liquidity')
-    else: reads.append('Low liquidity')
+    else:              reads.append('Low liquidity')
     if b >= 5: reads.append('High buy frequency')
     if t.migrated:
         reads.append('Migrated to Raydium')
     elif t.bonding_curve > 0:
         reads.append(f'Bonding curve {t.bonding_curve:.0f}%')
-    if age_min(t) < 5: reads.append('Very early launch')
+    if age_min(t) < 5:   reads.append('Very early launch')
     elif age_min(t) < 15: reads.append('Early stage')
     if t.twitter or t.telegram_link or t.website:
         reads.append('Has socials')
@@ -260,29 +269,29 @@ def security_read(t: Token) -> list:
 # ALERT FORMAT
 # =========================================================
 def build_alert(t: Token) -> str:
-    liq = get_liq(t)
-    src = liq_source(t)
-    p = pressure(t)
-    ns = net_sol(t)
-    vol = (t.sol_in + t.sol_out) * SOL_PRICE
-    sec = security_read(t)
+    liq  = get_liq(t)
+    src  = liq_source(t)
+    p    = pressure(t)
+    ps   = pool_sol(t)
+    vol  = (t.sol_in + t.sol_out) * SOL_PRICE   # volume still uses sol_in/sol_out
+    sec  = security_read(t)
     socials = []
-    if t.twitter: socials.append(f'[X]({t.twitter})')
+    if t.twitter:       socials.append(f'[X]({t.twitter})')
     if t.telegram_link: socials.append(f'[TG]({t.telegram_link})')
-    if t.website: socials.append(f'[Web]({t.website})')
-    soc = ' | '.join(socials) if socials else 'None'
-    sec_fmt = '\n'.join(f'- {s}' for s in sec)
+    if t.website:       socials.append(f'[Web]({t.website})')
+    soc      = ' | '.join(socials) if socials else 'None'
+    sec_fmt  = '\n'.join(f'- {s}' for s in sec)
     score_str = f'{t.last_score}' if t.last_score else '?'
     return (
         f'*GEM DETECTED* \\[Score: {score_str}\\]\n\n'
         f'*{t.name}* (${t.symbol})\n'
         f'Age: {age_str(t)}\n\n'
-        f'Market Cap : {fmt(t.market_cap)}\n'
-        f'Net Retained: {ns:.2f} SOL ({fmt(liq)} {src})\n'
-        f'Volume : {fmt(vol)}\n'
-        f'Buy / Sell : {t.buy_count} / {t.sell_count}\n'
-        f'Pressure : {p}%\n'
-        f'BPM : {bpm(t):.1f}\n'
+        f'Market Cap  : {fmt(t.market_cap)}\n'
+        f'Pool Depth  : {ps:.1f} SOL ({fmt(liq)} {src})\n'
+        f'Volume      : {fmt(vol)}\n'
+        f'Buy / Sell  : {t.buy_count} / {t.sell_count}\n'
+        f'Pressure    : {p}%\n'
+        f'BPM         : {bpm(t):.1f}\n'
         f'BC Progress : {t.bonding_curve:.0f}%\n\n'
         f'Security\n{sec_fmt}\n\n'
         f'Socials: {soc}\n\n'
@@ -300,7 +309,7 @@ async def fetch_raydium_liq(mint: str) -> float:
             pairs = [p for p in (data.get('pairs') or []) if p.get('chainId') == 'solana']
             if pairs:
                 best = max(pairs, key=lambda p: float((p.get('liquidity') or {}).get('usd', 0)))
-                liq = float((best.get('liquidity') or {}).get('usd', 0) or 0)
+                liq  = float((best.get('liquidity') or {}).get('usd', 0) or 0)
                 if liq > 0:
                     return liq
     except Exception as e:
@@ -316,9 +325,9 @@ async def fetch_pump_socials(mint: str) -> dict:
             r = await c.get(f'https://frontend-api.pump.fun/coins/{mint}')
             data = r.json()
             return {
-                'twitter': data.get('twitter', ''),
+                'twitter':  data.get('twitter', ''),
                 'telegram': data.get('telegram', ''),
-                'website': data.get('website', ''),
+                'website':  data.get('website', ''),
             }
     except Exception as e:
         log.debug(f'Pump socials fetch failed: {e}')
@@ -326,27 +335,24 @@ async def fetch_pump_socials(mint: str) -> dict:
 
 # =========================================================
 # SEND ALERT
-# FIX 2: t.called = True is now set ONLY after successful Telegram send.
-#         Previously it was set early in handle_event(), which meant a
-#         failed send would permanently silence the token with no retry.
+# t.called = True is set ONLY after a successful Telegram
+# send — a failed send leaves the token eligible for retry.
 # =========================================================
 async def send_alert(app: Application, t: Token) -> None:
-    # Brief delay: let bonding curve / socials / flow settle
     await asyncio.sleep(ALERT_DELAY_SEC)
 
-    # Re-evaluate after delay — conditions may have changed
     ok, reason = passes(t)
     if not ok:
         log.info(f'ALERT BLOCKED after delay: {t.name} ({t.symbol}) | {reason}')
         return
 
-    dex = f'https://dexscreener.com/solana/{t.mint}'
+    dex    = f'https://dexscreener.com/solana/{t.mint}'
     photon = f'https://photon-sol.tinyastro.io/en/lp/{t.mint}'
-    bullx = f'https://bullx.io/terminal?chainId=1399811149&address={t.mint}'
+    bullx  = f'https://bullx.io/terminal?chainId=1399811149&address={t.mint}'
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton('Photon', url=photon),
-        InlineKeyboardButton('BullX', url=bullx),
-        InlineKeyboardButton('Dex', url=dex),
+        InlineKeyboardButton('BullX',  url=bullx),
+        InlineKeyboardButton('Dex',    url=dex),
     ]])
     try:
         await app.bot.send_message(
@@ -356,9 +362,8 @@ async def send_alert(app: Application, t: Token) -> None:
             disable_web_page_preview=True,
             reply_markup=kb,
         )
-        # FIX 2: Only mark called=True AFTER the message successfully sends
-        t.called = True
-        t.entry_mc = t.market_cap
+        t.called     = True
+        t.entry_mc   = t.market_cap
         t.next_milestone = 2
         recent_calls.appendleft({
             'name': t.name, 'symbol': t.symbol, 'mint': t.mint,
@@ -367,7 +372,7 @@ async def send_alert(app: Application, t: Token) -> None:
         log.info(
             f'ALERT SENT: {t.name} ({t.symbol}) | '
             f'MC={fmt(t.market_cap)} | Liq={fmt(get_liq(t))} | '
-            f'Score={t.last_score} | NetSOL={net_sol(t):.2f}'
+            f'PoolSOL={pool_sol(t):.1f} | Score={t.last_score}'
         )
     except Exception as e:
         log.error(f'Alert send error: {e}')
@@ -382,7 +387,7 @@ async def check_milestones(app: Application, t: Token) -> None:
         return
     mult = t.market_cap / t.entry_mc
     if mult >= t.next_milestone:
-        m = t.next_milestone
+        m      = t.next_milestone
         next_m = next((x for x in MILESTONES if x > m), None)
         t.next_milestone = next_m
         try:
@@ -392,7 +397,7 @@ async def check_milestones(app: Application, t: Token) -> None:
                     f'*{m}x HIT*\n\n'
                     f'*{t.name}* (${t.symbol})\n'
                     f'Entry : {fmt(t.entry_mc)}\n'
-                    f'Now : {fmt(t.market_cap)}\n'
+                    f'Now   : {fmt(t.market_cap)}\n'
                     f'*{mult:.1f}x* from call\n\n'
                     f'`{t.mint}`'
                 ),
@@ -406,33 +411,33 @@ async def check_milestones(app: Application, t: Token) -> None:
 # =========================================================
 async def scan_ca(ca: str) -> str:
     if ca in tokens:
-        t = tokens[ca]
-        liq = get_liq(t)
+        t       = tokens[ca]
+        liq     = get_liq(t)
         ok, reason = passes(t)
         score, score_reasons = compute_score(t)
-        vol = (t.sol_in + t.sol_out) * SOL_PRICE
+        vol     = (t.sol_in + t.sol_out) * SOL_PRICE
         socials = []
-        if t.twitter: socials.append(f'[X]({t.twitter})')
+        if t.twitter:       socials.append(f'[X]({t.twitter})')
         if t.telegram_link: socials.append(f'[TG]({t.telegram_link})')
-        if t.website: socials.append(f'[Web]({t.website})')
-        soc = ' | '.join(socials) if socials else 'None'
-        sec = security_read(t)
+        if t.website:       socials.append(f'[Web]({t.website})')
+        soc     = ' | '.join(socials) if socials else 'None'
+        sec     = security_read(t)
         sec_fmt = '\n'.join(f'- {s}' for s in sec)
-        dex = f'https://dexscreener.com/solana/{ca}'
-        photon = f'https://photon-sol.tinyastro.io/en/lp/{ca}'
+        dex     = f'https://dexscreener.com/solana/{ca}'
+        photon  = f'https://photon-sol.tinyastro.io/en/lp/{ca}'
         return (
             f'*{t.name}* (${t.symbol})\n'
             f'Age: {age_str(t)}\n\n'
-            f'Market Cap : {fmt(t.market_cap)}\n'
-            f'Net Retained: {net_sol(t):.2f} SOL ({fmt(liq)} {liq_source(t)})\n'
-            f'Volume : {fmt(vol)}\n'
-            f'Buy / Sell : {t.buy_count} / {t.sell_count}\n'
-            f'Pressure : {pressure(t)}%\n'
-            f'BPM : {bpm(t):.1f}\n'
+            f'Market Cap  : {fmt(t.market_cap)}\n'
+            f'Pool Depth  : {pool_sol(t):.2f} SOL ({fmt(liq)} {liq_source(t)})\n'
+            f'Volume      : {fmt(vol)}\n'
+            f'Buy / Sell  : {t.buy_count} / {t.sell_count}\n'
+            f'Pressure    : {pressure(t)}%\n'
+            f'BPM         : {bpm(t):.1f}\n'
             f'BC Progress : {t.bonding_curve:.0f}%\n\n'
             f'Security\n{sec_fmt}\n\n'
             f'Socials: {soc}\n\n'
-            f'Score : {score}/{MIN_SCORE} | Filter: {"PASS" if ok else reason}\n\n'
+            f'Score  : {score}/{MIN_SCORE} | Filter: {"PASS" if ok else reason}\n\n'
             f'[Dex]({dex}) | [Photon]({photon})\n'
             f'`{ca}`'
         )
@@ -440,46 +445,46 @@ async def scan_ca(ca: str) -> str:
     # Fallback: hit DexScreener directly
     try:
         async with httpx.AsyncClient(timeout=12) as c:
-            r = await c.get(f'https://api.dexscreener.com/latest/dex/tokens/{ca}')
+            r    = await c.get(f'https://api.dexscreener.com/latest/dex/tokens/{ca}')
             data = r.json()
             pairs = [p for p in (data.get('pairs') or []) if p.get('chainId') == 'solana']
             if pairs:
-                pair = max(pairs, key=lambda p: float((p.get('liquidity') or {}).get('usd', 0)))
-                base = pair.get('baseToken', {})
-                mc = float(pair.get('fdv') or 0)
-                liq = float((pair.get('liquidity') or {}).get('usd', 0) or 0)
-                vol24 = float((pair.get('volume') or {}).get('h24', 0) or 0)
-                buys1 = int((pair.get('txns') or {}).get('h1', {}).get('buys', 0))
+                pair   = max(pairs, key=lambda p: float((p.get('liquidity') or {}).get('usd', 0)))
+                base   = pair.get('baseToken', {})
+                mc     = float(pair.get('fdv') or 0)
+                liq    = float((pair.get('liquidity') or {}).get('usd', 0) or 0)
+                vol24  = float((pair.get('volume') or {}).get('h24', 0) or 0)
+                buys1  = int((pair.get('txns') or {}).get('h1', {}).get('buys', 0))
                 sells1 = int((pair.get('txns') or {}).get('h1', {}).get('sells', 0))
-                total = buys1 + sells1
-                pres = int(buys1 / total * 100) if total else 0
-                pc1h = float((pair.get('priceChange') or {}).get('h1', 0) or 0)
+                total  = buys1 + sells1
+                pres   = int(buys1 / total * 100) if total else 0
+                pc1h   = float((pair.get('priceChange') or {}).get('h1', 0) or 0)
                 socials_d = []
                 for s in (pair.get('info') or {}).get('socials', []):
                     url = s.get('url', '')
                     if url: socials_d.append(f'[{s.get("type","Link").capitalize()}]({url})')
                 soc = ' | '.join(socials_d) if socials_d else 'None'
                 reads = []
-                if pres >= 65: reads.append('Strong buy pressure')
+                if pres >= 65:  reads.append('Strong buy pressure')
                 elif pres >= 50: reads.append('Moderate buy pressure')
-                else: reads.append('Sell pressure present')
-                if liq >= 10_000: reads.append('Good liquidity')
+                else:            reads.append('Sell pressure present')
+                if liq >= 10_000:  reads.append('Good liquidity')
                 elif liq >= 3_000: reads.append('Decent liquidity')
-                else: reads.append('Low liquidity')
-                if pc1h > 20: reads.append('Strong 1h momentum')
+                else:              reads.append('Low liquidity')
+                if pc1h > 20:   reads.append('Strong 1h momentum')
                 elif pc1h < -20: reads.append('Dumping last hour')
                 if mc < 30_000: reads.append('Very early stage')
                 sec_fmt = '\n'.join(f'- {r}' for r in reads[:4])
-                dex = f'https://dexscreener.com/solana/{ca}'
+                dex    = f'https://dexscreener.com/solana/{ca}'
                 photon = f'https://photon-sol.tinyastro.io/en/lp/{ca}'
-                bullx = f'https://bullx.io/terminal?chainId=1399811149&address={ca}'
+                bullx  = f'https://bullx.io/terminal?chainId=1399811149&address={ca}'
                 return (
                     f'*{base.get("name","?")}* (${base.get("symbol","?")})\n\n'
                     f'Market Cap : {fmt(mc)}\n'
-                    f'Liq Pool : {fmt(liq)}\n'
-                    f'Volume : {fmt(vol24)}\n'
+                    f'Liq Pool   : {fmt(liq)}\n'
+                    f'Volume     : {fmt(vol24)}\n'
                     f'Buy / Sell : {buys1} / {sells1} (1h)\n'
-                    f'Pressure : {pres}%\n\n'
+                    f'Pressure   : {pres}%\n\n'
                     f'Security\n{sec_fmt}\n\n'
                     f'Socials: {soc}\n\n'
                     f'[Dex]({dex}) | [Photon]({photon}) | [BullX]({bullx})\n'
@@ -501,16 +506,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         '*GemStalker* is live\n\n'
         'Scanning pump.fun websocket in real-time.\n'
         'Paste any Solana CA to analyse it.\n\n'
-        '/status - live stats\n'
-        '/calls - this month calls\n'
+        '/status  - live stats\n'
+        '/calls   - this month calls\n'
         '/filters - active filters\n'
-        '/debug - top watchlist candidates',
+        '/debug   - top watchlist candidates',
         parse_mode='Markdown',
     )
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    total = len(tokens)
-    alerted = sum(1 for t in tokens.values() if t.called)
+    total    = len(tokens)
+    alerted  = sum(1 for t in tokens.values() if t.called)
     watching = sum(1 for t in tokens.values() if t.watchlist and not t.called)
     top = sorted(
         [t for t in tokens.values() if not t.called and t.buy_count >= 2],
@@ -519,9 +524,9 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     msg = (
         '*GemStalker Status*\n\n'
         f'Tokens tracked : {total}\n'
-        f'Watchlist : {watching}\n'
-        f'Alerts sent : {alerted}\n'
-        f'SOL Price : ${SOL_PRICE:.2f}\n'
+        f'Watchlist      : {watching}\n'
+        f'Alerts sent    : {alerted}\n'
+        f'SOL Price      : ${SOL_PRICE:.2f}\n'
     )
     if top:
         msg += '\n*Top candidates (by score):*\n'
@@ -529,7 +534,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             ok, reason = passes(t)
             msg += (
                 f'\n*{t.name}* (${t.symbol})\n'
-                f'MC: {fmt(t.market_cap)} | NetSOL: {net_sol(t):.1f} | Score: {t.last_score}\n'
+                f'MC: {fmt(t.market_cap)} | PoolSOL: {pool_sol(t):.1f} | Score: {t.last_score}\n'
                 f'{"✅ PASS" if ok else f"❌ {reason}"}\n'
             )
     await update.message.reply_text(msg, parse_mode='Markdown')
@@ -549,7 +554,7 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         score, score_reasons = compute_score(t)
         lines.append(
             f'*{t.name}* | Score {score} | Age {age_str(t)}\n'
-            f'MC={fmt(t.market_cap)} NetSOL={net_sol(t):.1f} Pressure={pressure(t)}% BPM={bpm(t):.1f}\n'
+            f'MC={fmt(t.market_cap)} PoolSOL={pool_sol(t):.1f} Pressure={pressure(t)}% BPM={bpm(t):.1f}\n'
             f'{"✅ PASS" if ok else f"❌ {reason}"}\n'
             f'_{" | ".join(score_reasons[:3])}_\n'
         )
@@ -567,7 +572,7 @@ async def cmd_calls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     month_name = time.strftime('%B %Y')
     lines = [f'*Calls - {month_name}* ({len(month_calls)} total)\n']
     for i, c in enumerate(month_calls, 1):
-        mint = c['mint']
+        mint     = c['mint']
         entry_mc = c['mc']
         mult_str = 'tracking...'
         if mint in tokens:
@@ -583,15 +588,15 @@ async def cmd_calls(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         '*Active Filters*\n\n'
-        f'MC Range : {fmt(MC_MIN)} – {fmt(MC_MAX)}\n'
-        f'Min Net SOL : {MIN_NET_SOL} SOL\n'
+        f'MC Range     : {fmt(MC_MIN)} – {fmt(MC_MAX)}\n'
+        f'Min Pool SOL : {MIN_POOL_SOL} SOL\n'
         f'Min Pressure : {MIN_PRESSURE}%\n'
-        f'Min BPM : {MIN_BPM}\n'
-        f'Min Buys : {MIN_BUYS}\n'
-        f'Max Age : {MAX_AGE_MINUTES}m\n'
-        f'BC Range : {BC_MIN}% – {BC_MAX}%\n'
-        f'Min Score : {MIN_SCORE}\n\n'
-        f'SOL Price : ${SOL_PRICE:.2f}',
+        f'Min BPM      : {MIN_BPM}\n'
+        f'Min Buys     : {MIN_BUYS}\n'
+        f'Max Age      : {MAX_AGE_MINUTES}m\n'
+        f'BC Range     : {BC_MIN}% – {BC_MAX}%\n'
+        f'Min Score    : {MIN_SCORE}\n\n'
+        f'SOL Price    : ${SOL_PRICE:.2f}',
         parse_mode='Markdown',
     )
 
@@ -604,7 +609,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if not matches:
             return
         ca = matches[0]
-    msg = await update.message.reply_text(f'Scanning {ca[:12]}...')
+    msg    = await update.message.reply_text(f'Scanning {ca[:12]}...')
     result = await scan_ca(ca)
     try:
         await msg.edit_text(result, parse_mode='Markdown', disable_web_page_preview=True)
@@ -612,88 +617,125 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await msg.edit_text(result, disable_web_page_preview=True)
 
 # =========================================================
-# WEBSOCKET EVENT HANDLER
+# EVENT VALIDATION & NORMALISATION
 # =========================================================
-async def handle_event(app: Application, msg: dict) -> None:
+def validate_and_normalize_event(raw_msg: dict) -> tuple[bool, dict | None]:
+    """
+    Validates and normalises an incoming websocket event.
+    Key fix: solAmount is in lamports → divide by 1e9 here.
+    virtualSolReserves is also in lamports → divide by 1e9 here.
+    bondingCurveProgress arrives as 0-100 → kept as-is (0-100).
+    """
+    if not raw_msg.get('mint'):
+        return False, None
+
+    tx_type = (raw_msg.get('txType') or '').lower()
+    if tx_type not in ('buy', 'sell', 'create', 'new', 'mint'):
+        if tx_type:
+            log.debug(f'Unknown txType: {tx_type}')
+        return False, None
+
+    normalized_tx = 'buy' if tx_type == 'buy' else 'sell' if tx_type == 'sell' else 'create'
+
+    # bondingCurveProgress: handle both 0-1 and 0-100 scales defensively
+    bc_raw = float(raw_msg.get('bondingCurveProgress') or 0)
+    bc_pct = bc_raw if bc_raw > 1 else bc_raw * 100   # normalise to 0-100
+
+    normalized = {
+        'mint':                 raw_msg['mint'].strip(),
+        'txType':               normalized_tx,
+        'name':                 (raw_msg.get('name') or 'Unknown').strip()[:100],
+        'symbol':               (raw_msg.get('symbol') or '?').strip()[:20],
+        # ---- CRITICAL FIX: both amounts arrive in lamports ----
+        'solAmount':            max(float(raw_msg.get('solAmount') or 0), 0) / 1e9,
+        'virtualSolReserves':   max(float(raw_msg.get('virtualSolReserves') or 0), 0) / 1e9,
+        # -------------------------------------------------------
+        'marketCapSol':         max(float(raw_msg.get('marketCapSol') or 0), 0),
+        'bondingCurveProgress': bc_pct,
+        'raydiumPool':          raw_msg.get('raydiumPool') or '',
+        'twitter':              (raw_msg.get('twitter') or '').strip(),
+        'telegram':             (raw_msg.get('telegram') or '').strip(),
+        'website':              (raw_msg.get('website') or '').strip(),
+    }
+    return True, normalized
+
+# =========================================================
+# HANDLE EVENT
+# =========================================================
+async def handle_event(app: Application, normalized: dict) -> None:
     global ev_count, buy_count_global
-    tx_type = msg.get('txType')
-    mint = msg.get('mint')
+
+    tx_type = normalized['txType']
+    mint    = normalized['mint']
     ev_count += 1
 
-    # Track raw event types for WS health debugging
-    ev_key = tx_type or 'unknown'
-    ws_event_counts[ev_key] = ws_event_counts.get(ev_key, 0) + 1
-
-    if not mint:
-        return
+    ws_event_counts[tx_type] = ws_event_counts.get(tx_type, 0) + 1
 
     if mint not in tokens:
         tokens[mint] = Token(mint=mint)
+
     t = tokens[mint]
     t.last_active = time.time()
-    t.name = msg.get('name', t.name) or t.name
-    t.symbol = msg.get('symbol', t.symbol) or t.symbol
+    t.name   = normalized['name']   or t.name
+    t.symbol = normalized['symbol'] or t.symbol
 
-    # Market cap
-    mc_sol = float(msg.get('marketCapSol', 0) or 0)
-    if mc_sol > 0:
-        t.market_cap = mc_sol * SOL_PRICE
+    # Market cap (SOL → USD)
+    if normalized['marketCapSol'] > 0:
+        t.market_cap = normalized['marketCapSol'] * SOL_PRICE
 
-    # Virtual reserves (kept for reference, NOT used for liq calculation)
-    v_sol = float(msg.get('virtualSolReserves', 0) or 0) / 1e9
-    if v_sol > 0:
-        t.virtual_sol = v_sol
+    # Virtual SOL reserves = real pool depth (already in SOL after normalisation)
+    if normalized['virtualSolReserves'] > 0:
+        t.virtual_sol = normalized['virtualSolReserves']
 
-    t.bonding_curve = float(msg.get('bondingCurveProgress', 0) or 0)
-    sol_amt = float(msg.get('solAmount', 0) or 0)
+    # Bonding curve 0-100
+    t.bonding_curve = min(normalized['bondingCurveProgress'], 100.0)
+
+    sol_amt = normalized['solAmount']   # already in SOL
 
     if tx_type == 'buy':
         buy_count_global += 1
         t.buy_count += 1
-        t.sol_in += sol_amt
+        t.sol_in    += sol_amt
         t.buys_ts.append(time.time())
+        log.debug(f'BUY: {t.name} | +{sol_amt:.4f} SOL | pool={t.virtual_sol:.2f} SOL')
     elif tx_type == 'sell':
         t.sell_count += 1
-        t.sol_out += sol_amt
+        t.sol_out    += sol_amt
+        log.debug(f'SELL: {t.name} | -{sol_amt:.4f} SOL | pool={t.virtual_sol:.2f} SOL')
 
-    # Socials inline
+    # Socials
     for field_name, attr in [('twitter', 'twitter'), ('telegram', 'telegram_link'), ('website', 'website')]:
-        val = msg.get(field_name, '')
+        val = normalized.get(field_name, '')
         if val and not getattr(t, attr):
             setattr(t, attr, val)
 
     # Migration
-    if msg.get('raydiumPool') and not t.migrated:
+    if normalized['raydiumPool'] and not t.migrated:
         t.migrated = True
-        log.info(f'Migration: {t.name} ({t.symbol})')
+        log.info(f'Migration detected: {t.name} ({t.symbol})')
         asyncio.create_task(fetch_and_set_raydium_liq(t))
 
-    # Already alerted — just track milestones
+    # Already alerted — track milestones only
     if t.called:
         await check_milestones(app, t)
         return
 
-    # Compute score for every event (cheap; needed for debug visibility)
+    # Score & filter
     score, score_reasons = compute_score(t)
     t.last_score = score
 
     ok, reason = passes(t)
     if ok:
-        # FIX 2: Do NOT set t.called = True here.
-        # It is now set inside send_alert() only after the Telegram message
-        # successfully sends. This prevents tokens from being silently dropped
-        # if the send fails.
         if not t.twitter and not t.telegram_link and not t.website:
             asyncio.create_task(fetch_and_set_socials(app, t))
         else:
             asyncio.create_task(send_alert(app, t))
     else:
-        # Periodic rejection logging (every 10 buys to avoid spam)
         if tx_type == 'buy' and t.buy_count % 10 == 0:
             log.info(
                 f'SKIP: {t.name} ({t.symbol}) | '
-                f'Score={score} | {reason} | '
-                f'MC={fmt(t.market_cap)} | NetSOL={net_sol(t):.2f} | '
+                f'Score={score}/{MIN_SCORE} | {reason} | '
+                f'MC={fmt(t.market_cap)} | PoolSOL={pool_sol(t):.2f} | '
                 f'Buys={t.buy_count} | Pressure={pressure(t)}% | BPM={bpm(t):.1f}'
             )
 
@@ -705,61 +747,105 @@ async def fetch_and_set_raydium_liq(t: Token) -> None:
 
 async def fetch_and_set_socials(app: Application, t: Token) -> None:
     socials = await fetch_pump_socials(t.mint)
-    if socials.get('twitter'): t.twitter = socials['twitter']
+    if socials.get('twitter'):  t.twitter       = socials['twitter']
     if socials.get('telegram'): t.telegram_link = socials['telegram']
-    if socials.get('website'): t.website = socials['website']
+    if socials.get('website'):  t.website       = socials['website']
     await send_alert(app, t)
 
 # =========================================================
 # WEBSOCKET LOOP
 # =========================================================
 async def websocket_loop(app: Application) -> None:
-    retries = 0
+    retries        = 0
+    connection_uri = PUMP_WS + (f'?api-key={PUMPPORTAL_KEY}' if PUMPPORTAL_KEY else '')
+
     while True:
         try:
             log.info(f'WS connecting (attempt {retries+1})')
             async with websockets.connect(
-                PUMP_WS,
+                connection_uri,
                 ping_interval=20,
                 ping_timeout=30,
                 close_timeout=10,
             ) as ws:
                 retries = 0
                 log.info('WS connected to pumpportal.fun')
+
                 await ws.send(json.dumps({'method': 'subscribeNewToken'}))
-                await ws.send(json.dumps({'method': 'subscribeTokenTrade'}))
-                log.info('WS subscriptions sent: subscribeNewToken + subscribeTokenTrade')
-                hb = time.time()
+                log.info('WS subscription sent: subscribeNewToken')
+
+                hb    = time.time()
+                stats = {'received': 0, 'valid': 0, 'invalid': 0, 'by_type': {}}
+
                 async for raw in ws:
                     try:
                         msg = json.loads(raw)
-                        # Log first few events of each type for WS health check
-                        tx_type = msg.get('txType')
-                        if tx_type and ws_event_counts.get(tx_type, 0) < 3:
+                        if not msg:
+                            stats['invalid'] += 1
+                            continue
+
+                        stats['received'] += 1
+                        tx_type = msg.get('txType', 'unknown')
+                        stats['by_type'][tx_type] = stats['by_type'].get(tx_type, 0) + 1
+
+                        is_valid, normalized = validate_and_normalize_event(msg)
+                        if not is_valid:
+                            stats['invalid'] += 1
+                            continue
+
+                        stats['valid'] += 1
+
+                        # Sample log for first few events of each type
+                        if stats['by_type'].get(normalized['txType'], 0) <= 3:
                             log.debug(
-                                f'[WS SAMPLE] txType={tx_type} '
-                                f'mint={msg.get("mint","?")[:10]} '
-                                f'solAmount={msg.get("solAmount")} '
-                                f'marketCapSol={msg.get("marketCapSol")} '
-                                f'bcProgress={msg.get("bondingCurveProgress")}'
+                                f'[WS SAMPLE] txType={normalized["txType"]} '
+                                f'mint={normalized["mint"][:12]} '
+                                f'solAmount={normalized["solAmount"]:.4f} SOL '
+                                f'virtualSol={normalized["virtualSolReserves"]:.2f} SOL '
+                                f'marketCapSol={normalized["marketCapSol"]:.2f} '
+                                f'bc={normalized["bondingCurveProgress"]:.1f}%'
                             )
-                        await handle_event(app, msg)
+
+                        # Per-token trade subscription for new tokens
+                        if normalized['txType'] == 'create':
+                            mint = normalized['mint']
+                            if mint not in subscribed_tokens and len(subscribed_tokens) < MAX_SUBSCRIPTIONS:
+                                try:
+                                    await ws.send(json.dumps({
+                                        'method': 'subscribeTokenTrade',
+                                        'keys':   [mint]
+                                    }))
+                                    subscribed_tokens.add(mint)
+                                    log.info(
+                                        f'Subscribed: {normalized["name"]} ({normalized["symbol"]}) '
+                                        f'| {mint[:12]} | total={len(subscribed_tokens)}'
+                                    )
+                                except Exception as e:
+                                    log.error(f'Subscribe error {mint}: {e}')
+
+                        await handle_event(app, normalized)
+
                         # Heartbeat every 60 s
                         if time.time() - hb > 60:
                             hb = time.time()
                             alerted = sum(1 for t in tokens.values() if t.called)
                             log.info(
                                 f'WS alive | tokens={len(tokens)} alerts={alerted} '
-                                f'ev={ev_count} | event_types={dict(list(ws_event_counts.items())[:6])}'
+                                f'subscribed={len(subscribed_tokens)} | '
+                                f'recv={stats["received"]} valid={stats["valid"]} invalid={stats["invalid"]} | '
+                                f'types={dict(list(stats["by_type"].items())[:8])}'
                             )
-                    except json.JSONDecodeError:
-                        pass
+                            stats = {'received': 0, 'valid': 0, 'invalid': 0, 'by_type': {}}
+
+                    except json.JSONDecodeError as e:
+                        log.warning(f'JSON decode error: {e} | raw={raw[:100]}')
                     except Exception as e:
-                        log.error(f'Event handling error: {e}')
+                        log.error(f'Event handling error: {e}', exc_info=False)
+
         except Exception as e:
             retries += 1
-            wait = min(5 * retries, 30)
-            log.error(f'WS disconnected: {e} — retrying in {wait}s')
+            wait = min(5 * retries, 60)
+            log.error(f'WS disconnected: {e} — retrying in {wait}s (attempt {retries})')
             await asyncio.sleep(wait)
 
 # =========================================================
@@ -769,7 +855,7 @@ async def cleanup_tokens() -> None:
     while True:
         await asyncio.sleep(300)
         cutoff = time.time() - 3600
-        stale = [m for m, t in tokens.items() if t.last_active < cutoff and not t.called]
+        stale  = [m for m, t in tokens.items() if t.last_active < cutoff and not t.called]
         for m in stale:
             del tokens[m]
         if stale:
@@ -779,14 +865,14 @@ async def log_stats() -> None:
     global ev_count, buy_count_global
     while True:
         await asyncio.sleep(60)
-        alerted = sum(1 for t in tokens.values() if t.called)
+        alerted  = sum(1 for t in tokens.values() if t.called)
         watching = sum(1 for t in tokens.values() if t.watchlist and not t.called)
         log.info(
             f'STATS | ev={ev_count} buys={buy_count_global} '
             f'tokens={len(tokens)} watching={watching} alerts={alerted} '
             f'ws_events={dict(list(ws_event_counts.items())[:6])}'
         )
-        ev_count = 0
+        ev_count         = 0
         buy_count_global = 0
 
 # =========================================================
@@ -813,18 +899,21 @@ async def post_init(app: Application) -> None:
     asyncio.create_task(websocket_loop(app))
     asyncio.create_task(cleanup_tokens())
     asyncio.create_task(log_stats())
-    log.info('GemStalker ready — score-based pre-migration detection active')
+    log.info('GemStalker ready — pool-depth liquidity active')
 
 def main() -> None:
     if not TG_TOKEN: raise RuntimeError('TELEGRAM_BOT_TOKEN not set')
-    if not CHAT_ID: raise RuntimeError('CHAT_ID not set')
+    if not CHAT_ID:  raise RuntimeError('CHAT_ID not set')
+    if not PUMPPORTAL_KEY:
+        log.warning('PUMPPORTAL_API_KEY not set — connection may be rate-limited')
+
     threading.Thread(target=run_health, daemon=True).start()
     app = Application.builder().token(TG_TOKEN).build()
-    app.add_handler(CommandHandler('start', cmd_start))
-    app.add_handler(CommandHandler('status', cmd_status))
-    app.add_handler(CommandHandler('calls', cmd_calls))
+    app.add_handler(CommandHandler('start',   cmd_start))
+    app.add_handler(CommandHandler('status',  cmd_status))
+    app.add_handler(CommandHandler('calls',   cmd_calls))
     app.add_handler(CommandHandler('filters', cmd_filters))
-    app.add_handler(CommandHandler('debug', cmd_debug))
+    app.add_handler(CommandHandler('debug',   cmd_debug))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.post_init = post_init
     log.info('GemStalker starting')
@@ -832,293 +921,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-# =========================================================
-# CONFIG - ADD THESE
-# =========================================================
-PUMPPORTAL_KEY = os.getenv('PUMPPORTAL_API_KEY', '')  # Optional but recommended
-PUMPPORTAL_WS = 'wss://pumpportal.fun/api/data'
-
-# Track which tokens we're subscribed to
-subscribed_tokens: set = set()
-max_subscriptions = 500  # PumpPortal practical limit per connection
-
-# =========================================================
-# EVENT VALIDATION & NORMALIZATION
-# =========================================================
-def validate_and_normalize_event(raw_msg: dict) -> tuple[bool, dict | None]:
-    """
-    Validates incoming websocket event against expected schema.
-    Returns (is_valid, normalized_event).
-    Normalized event has consistent field types and scaling.
-    """
-    # Must have these minimal fields
-    if not raw_msg.get('mint'):
-        return False, None
-    
-    tx_type = (raw_msg.get('txType') or '').lower()
-    if tx_type not in ('buy', 'sell', 'create', 'new', 'mint'):
-        # Unknown tx type — may be valid but log for audit
-        if tx_type:
-            log.debug(f'Unknown txType: {tx_type}')
-        return False, None
-    
-    normalized = {
-        'mint': raw_msg['mint'].strip(),
-        'txType': 'buy' if tx_type == 'buy' else 'sell' if tx_type == 'sell' else 'create',
-        'name': (raw_msg.get('name') or 'Unknown').strip()[:100],
-        'symbol': (raw_msg.get('symbol') or '?').strip()[:20],
-        'solAmount': max(float(raw_msg.get('solAmount') or 0), 0),
-        'marketCapSol': max(float(raw_msg.get('marketCapSol') or 0), 0),
-        'virtualSolReserves': max(float(raw_msg.get('virtualSolReserves') or 0), 0) / 1e9,
-        'bondingCurveProgress': float(raw_msg.get('bondingCurveProgress') or 0),
-        'raydiumPool': raw_msg.get('raydiumPool') or '',
-        'twitter': (raw_msg.get('twitter') or '').strip(),
-        'telegram': (raw_msg.get('telegram') or '').strip(),
-        'website': (raw_msg.get('website') or '').strip(),
-    }
-    
-    # Validate bonding curve scale: if > 1, assume it's 0-100 and normalize to 0-1
-    if normalized['bondingCurveProgress'] > 1:
-        normalized['bondingCurveProgress'] = min(normalized['bondingCurveProgress'] / 100, 1.0)
-    
-    return True, normalized
-
-# =========================================================
-# WEBSOCKET LOOP - REFACTORED
-# =========================================================
-async def websocket_loop(app: Application) -> None:
-    """
-    Enhanced websocket handler with:
-    - API key support
-    - Per-token subscription (not global)
-    - Event validation
-    - Robust error handling & logging
-    """
-    retries = 0
-    connection_uri = PUMPPORTAL_WS
-    if PUMPPORTAL_KEY:
-        connection_uri += f'?api-key={PUMPPORTAL_KEY}'
-    
-    while True:
-        try:
-            log.info(f'WS connecting (attempt {retries+1}) to {PUMPPORTAL_WS}')
-            async with websockets.connect(
-                connection_uri,
-                ping_interval=20,
-                ping_timeout=30,
-                close_timeout=10,
-            ) as ws:
-                retries = 0
-                log.info('WS connected to pumpportal.fun')
-                
-                # Subscribe to new token announcements (global)
-                await ws.send(json.dumps({'method': 'subscribeNewToken'}))
-                log.info('WS subscription sent: subscribeNewToken')
-                
-                # Note: subscribeTokenTrade is per-token; we'll send it dynamically
-                # as we discover new tokens via subscribeNewToken
-                
-                hb = time.time()
-                event_validation_stats = {
-                    'received': 0, 'valid': 0, 'invalid': 0,
-                    'by_type': {}
-                }
-                
-                async for raw in ws:
-                    try:
-                        msg = json.loads(raw)
-                        
-                        # VALIDATION STEP 1: Reject null/empty
-                        if not msg:
-                            event_validation_stats['invalid'] += 1
-                            continue
-                        
-                        event_validation_stats['received'] += 1
-                        tx_type = msg.get('txType', 'unknown')
-                        event_validation_stats['by_type'][tx_type] = \
-                            event_validation_stats['by_type'].get(tx_type, 0) + 1
-                        
-                        # VALIDATION STEP 2: Normalize & validate
-                        is_valid, normalized = validate_and_normalize_event(msg)
-                        if not is_valid:
-                            event_validation_stats['invalid'] += 1
-                            continue
-                        
-                        event_validation_stats['valid'] += 1
-                        
-                        # Sample logging for first few events of each type (audit trail)
-                        if event_validation_stats['by_type'].get(normalized['txType'], 0) <= 3:
-                            log.debug(
-                                f'[WS EVENT SAMPLE] txType={normalized["txType"]} '
-                                f'mint={normalized["mint"][:12]} '
-                                f'solAmount={normalized["solAmount"]:.2f} '
-                                f'marketCapSol={normalized["marketCapSol"]:.2f} '
-                                f'bcProgress={normalized["bondingCurveProgress"]:.2f}'
-                            )
-                        
-                        # NEW TOKEN SUBSCRIPTION
-                        # If this is a new token (create/mint), subscribe to its trades
-                        if normalized['txType'] == 'create':
-                            mint = normalized['mint']
-                            if mint not in subscribed_tokens and len(subscribed_tokens) < max_subscriptions:
-                                try:
-                                    await ws.send(json.dumps({
-                                        'method': 'subscribeTokenTrade',
-                                        'keys': [mint]
-                                    }))
-                                    subscribed_tokens.add(mint)
-                                    log.info(
-                                        f'New token subscription: {normalized["name"]} ({normalized["symbol"]}) | '
-                                        f'mint={mint[:12]} | '
-                                        f'total_subscribed={len(subscribed_tokens)}'
-                                    )
-                                except Exception as e:
-                                    log.error(f'Failed to subscribe to token {mint}: {e}')
-                        
-                        # HANDLE EVENT
-                        await handle_event(app, normalized)
-                        
-                        # Heartbeat every 60s
-                        if time.time() - hb > 60:
-                            hb = time.time()
-                            alerted = sum(1 for t in tokens.values() if t.called)
-                            log.info(
-                                f'WS alive | '
-                                f'tokens_tracked={len(tokens)} '
-                                f'alerts_sent={alerted} '
-                                f'subscribed_to={len(subscribed_tokens)} '
-                                f'events_validation: '
-                                f'received={event_validation_stats["received"]} '
-                                f'valid={event_validation_stats["valid"]} '
-                                f'invalid={event_validation_stats["invalid"]} | '
-                                f'event_types={dict(list(event_validation_stats["by_type"].items())[:8])}'
-                            )
-                            event_validation_stats = {
-                                'received': 0, 'valid': 0, 'invalid': 0,
-                                'by_type': {}
-                            }
-                    
-                    except json.JSONDecodeError as e:
-                        log.warning(f'JSON decode error: {e} | raw={raw[:100]}')
-                    except Exception as e:
-                        log.error(f'Event handling error: {e}', exc_info=False)
-        
-        except Exception as e:
-            retries += 1
-            wait = min(5 * retries, 60)
-            log.error(f'WS disconnected: {e} — retrying in {wait}s (attempt {retries})')
-            await asyncio.sleep(wait)
-
-# =========================================================
-# UPDATE handle_event() TO USE NORMALIZED DATA
-# =========================================================
-async def handle_event(app: Application, normalized: dict) -> None:
-    """
-    Updated to accept pre-validated, normalized event.
-    All fields are guaranteed to exist and be correct type/scale.
-    """
-    global ev_count, buy_count_global
-    
-    tx_type = normalized['txType']
-    mint = normalized['mint']
-    ev_count += 1
-    
-    if mint not in tokens:
-        tokens[mint] = Token(mint=mint)
-    
-    t = tokens[mint]
-    t.last_active = time.time()
-    t.name = normalized['name'] or t.name
-    t.symbol = normalized['symbol'] or t.symbol
-    
-    # Market cap: convert from SOL to USD
-    if normalized['marketCapSol'] > 0:
-        t.market_cap = normalized['marketCapSol'] * SOL_PRICE
-    
-    # Virtual reserves (optional, for reference only)
-    if normalized['virtualSolReserves'] > 0:
-        t.virtual_sol = normalized['virtualSolReserves']
-    
-    # Bonding curve: now guaranteed to be 0–1 range
-    t.bonding_curve = min(normalized['bondingCurveProgress'] * 100, 100)  # Convert back to 0–100 for display
-    
-    sol_amt = normalized['solAmount']
-    
-    if tx_type == 'buy':
-        buy_count_global += 1
-        t.buy_count += 1
-        t.sol_in += sol_amt
-        t.buys_ts.append(time.time())
-        log.debug(f'BUY: {t.name} | +{sol_amt:.2f} SOL | total_in={t.sol_in:.2f}')
-    elif tx_type == 'sell':
-        t.sell_count += 1
-        t.sol_out += sol_amt
-        log.debug(f'SELL: {t.name} | -{sol_amt:.2f} SOL | total_out={t.sol_out:.2f}')
-    
-    # Socials
-    for field_name, attr in [('twitter', 'twitter'), ('telegram', 'telegram_link'), ('website', 'website')]:
-        val = normalized.get(field_name, '')
-        if val and not getattr(t, attr):
-            setattr(t, attr, val)
-    
-    # Migration to Raydium
-    if normalized['raydiumPool'] and not t.migrated:
-        t.migrated = True
-        log.info(f'Migration detected: {t.name} ({t.symbol})')
-        asyncio.create_task(fetch_and_set_raydium_liq(t))
-    
-    # Already alerted — track milestones only
-    if t.called:
-        await check_milestones(app, t)
-        return
-    
-    # Score & filter
-    score, score_reasons = compute_score(t)
-    t.last_score = score
-    
-    ok, reason = passes(t)
-    if ok:
-        if not t.twitter and not t.telegram_link and not t.website:
-            asyncio.create_task(fetch_and_set_socials(app, t))
-        else:
-            asyncio.create_task(send_alert(app, t))
-    else:
-        # Detailed rejection logging (once per 10 buys to avoid spam)
-        if tx_type == 'buy' and t.buy_count % 10 == 0:
-            log.info(
-                f'SKIP: {t.name} ({t.symbol}) | '
-                f'Score={score}/{MIN_SCORE} | {reason} | '
-                f'MC={fmt(t.market_cap)} | NetSOL={net_sol(t):.2f} | '
-                f'Buys={t.buy_count} | Pressure={pressure(t)}% | BPM={bpm(t):.1f}'
-            )
-
-# =========================================================
-# UPDATE main() TO SET API KEY
-# =========================================================
-def main() -> None:
-    if not TG_TOKEN: 
-        raise RuntimeError('TELEGRAM_BOT_TOKEN not set')
-    if not CHAT_ID: 
-        raise RuntimeError('CHAT_ID not set')
-    
-    # Warn if API key not provided (optional but recommended)
-    if not PUMPPORTAL_KEY:
-        log.warning(
-            'PUMPPORTAL_API_KEY not set. Connection may be rate-limited. '
-            'Set it for production use.'
-        )
-    
-    threading.Thread(target=run_health, daemon=True).start()
-    app = Application.builder().token(TG_TOKEN).build()
-    app.add_handler(CommandHandler('start', cmd_start))
-    app.add_handler(CommandHandler('status', cmd_status))
-    app.add_handler(CommandHandler('calls', cmd_calls))
-    app.add_handler(CommandHandler('filters', cmd_filters))
-    app.add_handler(CommandHandler('debug', cmd_debug))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.post_init = post_init
-    log.info('GemStalker starting with enhanced websocket validation')
-    app.run_polling(drop_pending_updates=True)
-
-if __name__ == '__main__':
-    main()    

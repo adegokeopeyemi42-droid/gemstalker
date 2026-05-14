@@ -17,6 +17,7 @@ Pre-migration Solana bonding curve scanner.
 - TELEGRAM_BOT_TOKEN
 - CHAT_ID
 - HELIUS_API_KEY
+- PUMPPORTAL_API_KEY
 
 ## Deploy
 

@@ -1,4 +1,4 @@
-  """
+"""
 GemStalker v2 — Multi-chain post-migration gem hunter
 Chains: Solana, Base, Ethereum (BSC optional)
 Sources: DexScreener, Birdeye, GeckoTerminal, Rugcheck/GoPlus

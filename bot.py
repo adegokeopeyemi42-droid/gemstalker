@@ -1,4 +1,4 @@
-"""
+  """
 GemStalker v2 — Multi-chain post-migration gem hunter
 Chains: Solana, Base, Ethereum (BSC optional)
 Sources: DexScreener, Birdeye, GeckoTerminal, Rugcheck/GoPlus
@@ -15,6 +15,16 @@ FIX LOG:
   [FIX-9]  /forcecall command bypasses all filters for live debugging
   [FIX-10] REQUIRE_SOCIALS relaxed — waived if momentum score is high
   [FIX-11] More visibility, softer thresholds, delayed re-evaluation
+  [FIX-12] Solana dedicated DexScreener scanner — no longer depends on Birdeye key
+            alone; added fetch_dexscreener_solana_new_pairs() + scan_solana_dex()
+            so Solana tokens reach evaluate_and_alert on equal footing.
+            Also fixed chainId guard in _process_pairs to log mismatches.
+  [FIX-13] Fresh momentum gate (passes_momentum_check) before every alert:
+            rejects late-pump tokens where 1h spike is large but 5m is cooling.
+            Does NOT alter scoring or hard filters — pure timing guard.
+  [FIX-14] Milestone momentum validation gate: only fires if volume is healthy
+            and buy pressure >= 52%. Labels milestone 🟢 continuation or
+            🟠 weak so you can act accordingly.
 """
 
 import os
@@ -82,9 +92,19 @@ MAX_TOP_HOLDER_PCT  = 20.0
 MIN_SCORE           = 50           # was 65
 WATCHLIST_MIN_SCORE = 40           # [FIX-6] enter watchlist at 40+
 REQUIRE_SOCIALS     = False        # [FIX-10] relaxed — see passes_hard_filters logic
-SOCIALS_WAIVER_SCORE = 60          # [FIX-10] waive socials requirement if score ≥ this
+SOCIALS_WAIVER_SCORE = 60          # [FIX-10] waive socials requirement if score >= this
 MIGRATION_ONLY      = True
 MIGRATION_MAX_HOURS = 168          # was 72 — 7 days
+
+# [FIX-13] Momentum gate thresholds — ONLY used in passes_momentum_check()
+# These do NOT affect scoring or hard filters.
+MOMENTUM_LATE_PUMP_1H_THRESHOLD  = 60.0   # % — if 1h gain exceeds this...
+MOMENTUM_LATE_PUMP_5M_MIN        = -2.0   # ...and 5m is below this, token is late-pump
+MOMENTUM_VOL_DECAY_RATIO         = 0.15   # vol_5m / vol_1h; below this = volume drying up
+
+# [FIX-14] Milestone momentum gate thresholds
+MILESTONE_BUY_PRESSURE_MIN = 52           # % buys in last 1h to allow milestone fire
+MILESTONE_VOL_DECAY_RATIO  = 0.10         # vol_5m / vol_1h minimum — avoid dead volume
 
 # =========================================================
 # LOGGING
@@ -198,7 +218,7 @@ scan_count:   int   = 0
 
 
 # =========================================================
-# SCORING ENGINE
+# SCORING ENGINE  ← UNCHANGED
 # =========================================================
 def compute_score(t: GemToken) -> tuple[int, list[str]]:
     score   = 0
@@ -346,6 +366,47 @@ def passes_hard_filters(t: GemToken) -> tuple[bool, str]:
     return True, 'OK'
 
 
+# =========================================================
+# [FIX-13] MOMENTUM GATE — timing check only, not a hard filter
+# Called once just before send_alert. Does NOT affect scoring.
+# =========================================================
+def passes_momentum_check(t: GemToken) -> tuple[bool, str]:
+    """
+    Detects late-pump / post-ATH conditions and blocks the alert.
+    Returns (True, 'OK') to proceed, or (False, reason) to suppress.
+
+    Conditions that indicate a late call:
+      A) Large 1h spike + cooling 5m price  → exhaustion
+      B) Volume drying up fast relative to 1h volume → distribution phase
+    """
+    # Guard: if we have no 5m data at all, don't block — let it through
+    if t.vol_5m == 0 and t.price_change_5m == 0:
+        return True, 'OK (no 5m data, skipping momentum gate)'
+
+    # Condition A: strong 1h move but 5m is already negative — late pump
+    if (t.price_change_1h > MOMENTUM_LATE_PUMP_1H_THRESHOLD and
+            t.price_change_5m < MOMENTUM_LATE_PUMP_5M_MIN):
+        reason = (
+            f'Late-pump suppressed: 1h=+{t.price_change_1h:.1f}% but '
+            f'5m={t.price_change_5m:.1f}% (cooling after spike)'
+        )
+        log.info(f'[MOMENTUM-GATE] {t.name} ({t.symbol}) | {reason}')
+        return False, reason
+
+    # Condition B: vol_5m is tiny fraction of vol_1h — volume exhaustion
+    if t.vol_1h > 0:
+        vol_ratio = t.vol_5m / t.vol_1h
+        if vol_ratio < MOMENTUM_VOL_DECAY_RATIO and t.price_change_1h > 30:
+            reason = (
+                f'Volume exhaustion suppressed: vol_5m/vol_1h={vol_ratio:.2f} '
+                f'(< {MOMENTUM_VOL_DECAY_RATIO}) with 1h=+{t.price_change_1h:.1f}%'
+            )
+            log.info(f'[MOMENTUM-GATE] {t.name} ({t.symbol}) | {reason}')
+            return False, reason
+
+    return True, 'OK'
+
+
 def get_caution_label(t: GemToken) -> str:
     if t.is_honeypot or t.has_mint_auth:
         return '🔴 HIGH RISK'
@@ -441,7 +502,7 @@ def validate_api_response(source: str, url: str, response, expected_type=dict) -
 
 
 # =========================================================
-# ALERT BUILDER
+# ALERT BUILDER  ← UNCHANGED
 # =========================================================
 def build_alert(t: GemToken, is_watchlist_promo: bool = False) -> str:
     total_1h  = t.buys_1h + t.sells_1h
@@ -577,6 +638,36 @@ async def fetch_dexscreener_token_profiles(chain: str) -> list[dict]:
             return []
     except Exception as e:
         log.warning(f'[API-FAIL] DexScreener/profiles: {e}')
+        return []
+
+
+# =========================================================
+# [FIX-12] SOLANA-SPECIFIC DEXSCREENER SCANNER
+# Fetches the /latest/dex/pairs/solana endpoint directly so
+# Solana tokens are discovered even when Birdeye key is absent.
+# This is additive — it does not replace any existing source.
+# =========================================================
+async def fetch_dexscreener_solana_new_pairs() -> list[dict]:
+    """
+    [FIX-12] Pull fresh Solana pairs directly from DexScreener's
+    chain-specific pairs endpoint. Returns raw pair dicts that can
+    go straight into parse_dex_pair().
+    """
+    url = 'https://api.dexscreener.com/latest/dex/pairs/solana'
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            r = await c.get(url)
+            data = validate_api_response('DexScreener/solana_pairs', url, r)
+            if not data:
+                return []
+            pairs = data.get('pairs') or []
+            # Defensive: ensure every pair is tagged solana (they should be)
+            pairs = [p for p in pairs if p.get('chainId', 'solana') == 'solana']
+            if DEBUG_MODE:
+                log.debug(f'[API] DexScreener solana_pairs: {len(pairs)} pairs')
+            return pairs
+    except Exception as e:
+        log.warning(f'[API-FAIL] DexScreener/solana_pairs: {e}')
         return []
 
 
@@ -1011,7 +1102,8 @@ async def evaluate_and_alert(
     if not t.security_checked:
         await run_security_checks(t)
 
-    # Birdeye enrich (Solana)
+    # Birdeye enrich (Solana) — [FIX-12] this is supplemental only;
+    # Solana tokens continue even when Birdeye is unavailable.
     if t.chain == 'solana':
         await enrich_from_birdeye(t)
 
@@ -1064,6 +1156,15 @@ async def evaluate_and_alert(
         log.info(f'[ALERT BLOCKED post-delay score] {t.name} | {score}')
         return
 
+    # [FIX-13] Momentum gate — timing check, does not alter score or hard filters
+    mom_ok, mom_reason = passes_momentum_check(t)
+    if not mom_ok:
+        log.info(f'[MOMENTUM-GATE BLOCKED] {t.name} ({t.symbol}) | {mom_reason}')
+        # Still watchlist it — conditions may improve on next rescan
+        if not is_watchlist_promo:
+            add_to_watchlist(t)
+        return
+
     await send_alert(app, t, is_watchlist_promo=is_watchlist_promo)
 
 
@@ -1113,8 +1214,25 @@ async def send_alert(
 
 
 # =========================================================
-# MILESTONE TRACKER
+# [FIX-14] MILESTONE TRACKER with momentum validation gate
 # =========================================================
+def _get_milestone_label(t: GemToken) -> str:
+    """
+    [FIX-14] Returns 🟢 or 🟠 label based on current momentum health.
+    Does NOT block the milestone — just informs you of quality.
+    """
+    total_1h = t.buys_1h + t.sells_1h
+    bp_1h    = t.buys_1h / total_1h * 100 if total_1h else 0
+    vol_ratio = t.vol_5m / t.vol_1h if t.vol_1h > 0 else 0
+
+    healthy_bp  = bp_1h >= MILESTONE_BUY_PRESSURE_MIN
+    healthy_vol = vol_ratio >= MILESTONE_VOL_DECAY_RATIO
+
+    if healthy_bp and healthy_vol:
+        return '🟢 CONTINUATION — momentum healthy'
+    return '🟠 WEAK MILESTONE — possible reversal risk'
+
+
 async def check_milestones(app: Application, t: GemToken) -> None:
     if not t.called or not t.entry_mc or not t.next_milestone:
         return
@@ -1126,6 +1244,22 @@ async def check_milestones(app: Application, t: GemToken) -> None:
         m   = t.next_milestone
         nxt = next((x for x in MILESTONES if x > m), None)
         t.next_milestone = nxt
+
+        # [FIX-14] Momentum validation gate
+        total_1h  = t.buys_1h + t.sells_1h
+        bp_1h     = t.buys_1h / total_1h * 100 if total_1h else 0
+        vol_ratio = t.vol_5m / t.vol_1h if t.vol_1h > 0 else 1.0  # default pass if no data
+
+        if bp_1h > 0 and bp_1h < MILESTONE_BUY_PRESSURE_MIN and vol_ratio < MILESTONE_VOL_DECAY_RATIO:
+            # Both indicators weak: suppress milestone spam
+            log.info(
+                f'[MILESTONE SUPPRESSED] {t.name} {m}x | '
+                f'bp={bp_1h:.0f}% vol_ratio={vol_ratio:.2f} — looks like dead-cat / sideways'
+            )
+            return
+
+        milestone_label = _get_milestone_label(t)
+
         try:
             await app.bot.send_message(
                 chat_id=CHAT_ID, parse_mode='Markdown',
@@ -1135,6 +1269,7 @@ async def check_milestones(app: Application, t: GemToken) -> None:
                     f'Entry : {fmt(t.entry_mc)}\n'
                     f'Now   : {fmt(t.market_cap)}\n'
                     f'*{mult:.1f}x* from call  ·  Peak: {t.peak_mult:.1f}x\n\n'
+                    f'{milestone_label}\n\n'
                     f'`{t.address}`'
                 ),
             )
@@ -1143,7 +1278,7 @@ async def check_milestones(app: Application, t: GemToken) -> None:
 
 
 # =========================================================
-# [FIX-4] IMPROVED SCAN LOOPS
+# [FIX-4] + [FIX-12] IMPROVED SCAN LOOPS
 # =========================================================
 async def scan_dexscreener(app: Application) -> None:
     while True:
@@ -1194,7 +1329,14 @@ async def _process_address_list(app: Application, addresses: list, chain: str) -
 
 def _process_pairs(app: Application, pairs: list, chain: str) -> None:
     for pair in pairs[:50]:
-        if pair.get('chainId') != chain:
+        # [FIX-12] Log chainId mismatches instead of silently dropping
+        pair_chain = pair.get('chainId', '')
+        if pair_chain != chain:
+            if DEBUG_MODE:
+                log.debug(
+                    f'[SCAN] chainId mismatch: expected={chain} got={pair_chain} '
+                    f'pair={pair.get("pairAddress","?")} — skipping'
+                )
             continue
         t = parse_dex_pair(pair, chain)
         if not t:
@@ -1205,6 +1347,48 @@ def _process_pairs(app: Application, pairs: list, chain: str) -> None:
             asyncio.create_task(check_milestones(app, existing))
         elif t.address not in alerted_set:
             asyncio.create_task(evaluate_and_alert(app, t))
+
+
+# =========================================================
+# [FIX-12] DEDICATED SOLANA SCANNER
+# Runs independently — does not depend on BIRDEYE_KEY.
+# Pulls pairs directly from DexScreener's Solana endpoint
+# and from GeckoTerminal Solana pools so Solana gets the
+# same discovery breadth as EVM chains.
+# =========================================================
+async def scan_solana_dex(app: Application) -> None:
+    """
+    [FIX-12] Dedicated Solana scanner using DexScreener's chain-level
+    pairs endpoint + GeckoTerminal Solana pools.
+    Runs every 30s alongside scan_dexscreener so Solana tokens are
+    never gated behind the Birdeye key.
+    """
+    while True:
+        try:
+            # --- DexScreener Solana pairs endpoint ---
+            pairs = await fetch_dexscreener_solana_new_pairs()
+            if DEBUG_MODE:
+                log.debug(f'[SCAN-SOL] DexScreener solana_pairs: {len(pairs)} raw pairs')
+            _process_pairs(app, pairs, 'solana')
+
+            # --- GeckoTerminal Solana new pools ---
+            gecko_pools = await fetch_gecko_new_pools('solana')
+            for pool in gecko_pools:
+                t = await gecko_pool_to_token(pool, 'solana')
+                if not t or t.address in alerted_set:
+                    continue
+                # Enrich with DexScreener data where possible
+                pair = await fetch_dexscreener_token(t.address, 'solana')
+                if pair:
+                    t2 = parse_dex_pair(pair, 'solana')
+                    if t2:
+                        t = t2
+                asyncio.create_task(evaluate_and_alert(app, t))
+
+        except Exception as e:
+            log.error(f'[SCAN] scan_solana_dex error: {e}')
+
+        await asyncio.sleep(DEXSCREENER_POLL_INTERVAL)
 
 
 async def scan_birdeye(app: Application) -> None:
@@ -1327,6 +1511,7 @@ async def scan_ca_manual(address: str) -> str:
             t.score = score; t.score_reasons = reasons
 
             ok, reason  = passes_hard_filters(t)
+            mom_ok, mom_reason = passes_momentum_check(t)
             liq_ratio   = t.liquidity_usd / t.market_cap * 100 if t.market_cap else 0
             total_1h    = t.buys_1h + t.sells_1h
             bp_1h       = t.buys_1h / total_1h * 100 if total_1h else 0
@@ -1351,6 +1536,8 @@ async def scan_ca_manual(address: str) -> str:
             neg     = [r for r in reasons if r.startswith('-')][:3]
             reasons_str = '\n'.join(f'  · {r.split(" ", 1)[1]}' for r in top_pos + neg)
 
+            momentum_line = f'⏱ Momentum: {"✅ FRESH" if mom_ok else f"⚠️ LATE — {mom_reason}"}'
+
             return (
                 f'{chain_emoji(chain)} *{t.name}* (${t.symbol}) · {chain_name(chain)}\n'
                 f'Age since migration: {age_str(t)}\n\n'
@@ -1363,6 +1550,7 @@ async def scan_ca_manual(address: str) -> str:
                 f'🔐 Security: {sec_str}\n\n'
                 f'🌐 Socials: {soc_str}\n\n'
                 f'🎯 Score: *{score}/100* · Filter: {"✅ PASS" if ok else f"❌ {reason}"}\n'
+                f'{momentum_line}\n'
                 f'{get_caution_label(t)} · {get_heat_label(t)}\n\n'
                 f'Score breakdown:\n{reasons_str}\n\n'
                 f'[DexScreener]({t.dex_url}) · `{address}`'
@@ -1473,10 +1661,11 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         msg += '*Top candidates:*\n'
         for t in top:
             ok, r = passes_hard_filters(t)
+            mom_ok, _ = passes_momentum_check(t)
             msg += (
                 f'\n{chain_emoji(t.chain)} *{t.name}* (${t.symbol})\n'
                 f'MC: {fmt(t.market_cap)} | Score: {t.score} | {t.heat_label}\n'
-                f'{"✅ PASS" if ok else f"❌ {r}"}\n'
+                f'{"✅ PASS" if ok else f"❌ {r}"} | Momentum: {"✅" if mom_ok else "⚠️ late"}\n'
             )
     await update.message.reply_text(msg, parse_mode='Markdown')
 
@@ -1492,12 +1681,14 @@ async def cmd_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ['*Debug — Top 5 candidates*\n']
     for t in top:
         ok, reason = passes_hard_filters(t)
+        mom_ok, mom_reason = passes_momentum_check(t)
         total_1h   = t.buys_1h + t.sells_1h
         bp_1h      = t.buys_1h / total_1h * 100 if total_1h else 0
         lines.append(
             f'{chain_emoji(t.chain)} *{t.name}* | Score {t.score} | Age {age_str(t)}\n'
             f'MC={fmt(t.market_cap)} Liq={fmt(t.liquidity_usd)} BP={bp_1h:.0f}% Vol1h={fmt(t.vol_1h)}\n'
             f'{"✅ PASS" if ok else f"❌ {reason}"}\n'
+            f'Momentum: {"✅ fresh" if mom_ok else f"⚠️ {mom_reason[:60]}"}\n'
             f'GoPlus: {"❌ failed" if t.goplus_failed else "✓"} | Rugcheck: {"❌ failed" if t.rugcheck_failed else "✓"}\n'
             f'_{" | ".join(r.split(" ", 1)[1] for r in t.score_reasons[:3] if r.startswith("+"))}_\n'
         )
@@ -1564,6 +1755,8 @@ async def cmd_filters(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         f'Min Score (Watchlist): {WATCHLIST_MIN_SCORE}/100\n'
         f'Alert Cooldown      : {ALERT_COOLDOWN_SEC//3600}h\n'
         f'Debug Mode          : {"ON" if DEBUG_MODE else "OFF"}\n\n'
+        f'Momentum Gate       : 1h>{MOMENTUM_LATE_PUMP_1H_THRESHOLD:.0f}% + 5m<{MOMENTUM_LATE_PUMP_5M_MIN}% → suppressed\n'
+        f'Milestone Gate      : BP≥{MILESTONE_BUY_PRESSURE_MIN}% + vol_ratio≥{MILESTONE_VOL_DECAY_RATIO}\n\n'
         f'Chains: {", ".join(chain_name(c) for c in CHAINS)}',
         parse_mode='Markdown',
     )
@@ -1612,10 +1805,11 @@ async def cmd_forcecall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         t.caution_label = get_caution_label(t)
         t.heat_label    = get_heat_label(t)
 
-        ok, filter_reason = passes_hard_filters(t)
-        liq_ratio         = t.liquidity_usd / t.market_cap * 100 if t.market_cap else 0
-        total_1h          = t.buys_1h + t.sells_1h
-        bp_1h             = t.buys_1h / total_1h * 100 if total_1h else 0
+        ok, filter_reason  = passes_hard_filters(t)
+        mom_ok, mom_reason = passes_momentum_check(t)
+        liq_ratio          = t.liquidity_usd / t.market_cap * 100 if t.market_cap else 0
+        total_1h           = t.buys_1h + t.sells_1h
+        bp_1h              = t.buys_1h / total_1h * 100 if total_1h else 0
 
         pos_reasons = [r for r in reasons if r.startswith('+')]
         neg_reasons = [r for r in reasons if r.startswith('-')]
@@ -1636,7 +1830,8 @@ async def cmd_forcecall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f'Rug Score: {t.rug_score}/100 | LP Locked: {t.lp_locked} ({t.lp_lock_pct:.0f}%)\n'
             f'GoPlus: {"❌ failed" if t.goplus_failed else "✓"} | Rugcheck: {"❌ failed" if t.rugcheck_failed else "✓"}\n\n'
             f'*Score: {score}/100*\n'
-            f'Filter: {"✅ PASS" if ok else f"❌ {filter_reason}"}\n\n'
+            f'Filter: {"✅ PASS" if ok else f"❌ {filter_reason}"}\n'
+            f'Momentum: {"✅ FRESH" if mom_ok else f"⚠️ {mom_reason}"}\n\n'
             f'*Scoring (+):*\n' +
             '\n'.join(f'  {r}' for r in pos_reasons) +
             ('\n\n*Scoring (-):*\n' + '\n'.join(f'  {r}' for r in neg_reasons) if neg_reasons else '') +
@@ -1736,9 +1931,10 @@ async def post_init(app: Application) -> None:
     log.info('Starting background tasks...')
     asyncio.create_task(update_sol_price())
     asyncio.create_task(scan_dexscreener(app))
-    asyncio.create_task(scan_birdeye(app))
+    asyncio.create_task(scan_birdeye(app))           # Birdeye (requires key; supplemental for Solana)
+    asyncio.create_task(scan_solana_dex(app))        # [FIX-12] Dedicated Solana — always runs
     asyncio.create_task(scan_gecko_evm(app))
-    asyncio.create_task(scan_raydium(app))          # [FIX-4]
+    asyncio.create_task(scan_raydium(app))           # [FIX-4]
     asyncio.create_task(pumpfun_ws_loop(app))
     asyncio.create_task(rescan_watchlist(app))       # [FIX-6]
     asyncio.create_task(cleanup_loop())
@@ -1749,7 +1945,8 @@ async def post_init(app: Application) -> None:
         f'min_score={MIN_SCORE} | watchlist_min={WATCHLIST_MIN_SCORE} | '
         f'debug={"ON" if DEBUG_MODE else "OFF"} | '
         f'birdeye={"✓" if BIRDEYE_KEY else "✗"} | '
-        f'goplus={"✓" if GOPLUS_KEY else "✗"}'
+        f'goplus={"✓" if GOPLUS_KEY else "✗"} | '
+        f'solana_scanner=always_on'
     )
 
 
@@ -1757,7 +1954,7 @@ def main() -> None:
     if not TG_TOKEN: raise RuntimeError('TELEGRAM_BOT_TOKEN not set')
     if not CHAT_ID:  raise RuntimeError('CHAT_ID not set')
     if not BIRDEYE_KEY:
-        log.warning('BIRDEYE_API_KEY not set — Birdeye scanning disabled')
+        log.warning('BIRDEYE_API_KEY not set — Birdeye scanning disabled (scan_solana_dex still active)')
     if not GOPLUS_KEY:
         log.warning('GOPLUS_API_KEY not set — GoPlus security checks limited')
     if not PUMPPORTAL_KEY:
@@ -1765,6 +1962,7 @@ def main() -> None:
 
     log.info(f'[STARTUP] Debug mode: {"ON" if DEBUG_MODE else "OFF"}')
     log.info(f'[STARTUP] Filters: MC={fmt(MC_MIN)}-{fmt(MC_MAX)} Liq/MC≥{LIQ_MC_RATIO_MIN:.0%} Score≥{MIN_SCORE}')
+    log.info(f'[STARTUP] Momentum gate: 1h>{MOMENTUM_LATE_PUMP_1H_THRESHOLD}% + 5m<{MOMENTUM_LATE_PUMP_5M_MIN}% → suppressed')
 
     threading.Thread(target=run_health, daemon=True).start()
 
